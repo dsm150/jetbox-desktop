@@ -1,0 +1,19 @@
+JetBox for Windows and macOS
+Copyright (c) 2026, JetNet. Licensed under the BSD 3-Clause License (see LICENSE).
+
+This product includes software developed by NetBird GmbH and contributors
+(https://github.com/netbirdio/netbird), licensed under the BSD 3-Clause License:
+  Copyright (c) 2022-2026 NetBird GmbH & AUTHORS
+The JetBox service is built from NetBird v0.81.4 client sources with patches
+in daemon/patches. JetBox is not affiliated with or endorsed by NetBird GmbH.
+
+This product includes Wails (https://wails.io), MIT License,
+Copyright (c) 2018-present Lea Anthony.
+
+The app UI uses React (https://react.dev), MIT License,
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+The Windows installer includes wintun.dll (https://www.wintun.net) by
+WireGuard LLC, distributed unmodified under its Prebuilt Binaries License,
+and the Microsoft Edge WebView2 bootstrapper (MicrosoftEdgeWebview2Setup.exe)
+by Microsoft Corporation, distributed unmodified.

@@ -1,0 +1,43 @@
+#!/bin/sh
+# После установки JetBox: каталоги и права, служба под launchd, автозапуск приложения
+# (LaunchAgent) для вошедшего пользователя и окно приложения.
+LABEL=net.jet-net.jetbox.daemon
+PLIST=/Library/LaunchDaemons/$LABEL.plist
+AGENT=net.jet-net.jetbox.desktop
+AGENT_PLIST=/Library/LaunchAgents/$AGENT.plist
+APP=/Applications/JetBox.app
+HELPER="/Library/Application Support/JetBox"
+LOG=/var/log/jetbox/install.log
+. "$(dirname "$0")/launchd.sh"
+mkdir -p /var/log/jetbox
+{
+  echo "$(date '+%F %T') postinstall"
+  mkdir -p /var/lib/jetbox
+  chown root:wheel /var/lib/jetbox /var/log/jetbox "$HELPER" "$HELPER/jetboxd" "$PLIST"
+  chmod 700 /var/lib/jetbox
+  chmod 755 /var/log/jetbox "$HELPER" "$HELPER/jetboxd"
+  chmod 644 "$PLIST"
+  [ -f "$AGENT_PLIST" ] && chown root:wheel "$AGENT_PLIST" && chmod 644 "$AGENT_PLIST"
+
+  # enable до bootstrap (если метку когда-то выключили, bootstrap падает), выгрузка с ожиданием
+  # и повторы — scripts/launchd.sh.
+  jb_load system "$LABEL" "$PLIST" || { echo "bootstrap службы не удался"; exit 1; }
+
+  # Ждём канал службы (до 10 с) — чтобы приложение сразу его увидело.
+  i=0
+  while [ $i -lt 20 ] && [ ! -S /var/run/jetbox.sock ]; do sleep 0.5; i=$((i + 1)); done
+  ls -l /var/run/jetbox.sock 2>/dev/null || echo "канал службы ещё не появился"
+
+  user=$(stat -f%Su /dev/console 2>/dev/null)
+  case "$user" in
+    ""|root|loginwindow|_mbsetupuser) echo "нет пользователя в консоли — приложение запустится при входе" ;;
+    *)
+      uid=$(id -u "$user")
+      if [ -f "$AGENT_PLIST" ]; then
+        jb_load "gui/$uid" "$AGENT" "$AGENT_PLIST" || echo "автозапуск для $user не поднялся (поднимется при входе)"
+        # Окно после установки: второй запуск отдаётся первому экземпляру (SingleInstance).
+        launchctl asuser "$uid" sudo -u "$user" open "$APP" || true
+      fi ;;
+  esac
+  exit 0
+} >>"$LOG" 2>&1

@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: JetBox build <build@jetbox.invalid>
+Date: Mon, 26 Oct 2026 16:01:35 +0300
+Subject: [PATCH] jetbox: do not auto-connect before the first login
+
+On start with an existing profile upstream dials the configured management
+right away. A freshly installed JetBox has never logged in, so this only
+reaches a server the user does not know about and shows Connecting instead
+of NeedsLogin. The service now records a successful login (setup key, SSO
+or an already registered key) in the state directory and auto-connects on
+start only when that mark exists; Logout clears it.
+---
+ client/server/jetbox_registered.go      | 67 +++++++++++++++++++++++++
+ client/server/jetbox_registered_test.go | 48 ++++++++++++++++++
+ client/server/server.go                 | 11 ++++
+ 3 files changed, 126 insertions(+)
+ create mode 100644 client/server/jetbox_registered.go
+ create mode 100644 client/server/jetbox_registered_test.go
+
+diff --git a/client/server/jetbox_registered.go b/client/server/jetbox_registered.go
+new file mode 100644
+index 0000000..00000d5
+--- /dev/null
++++ b/client/server/jetbox_registered.go
+@@ -0,0 +1,67 @@
++package server
++
++import (
++	"os"
++	"path/filepath"
++
++	log "github.com/sirupsen/logrus"
++
++	"github.com/netbirdio/netbird/client/configs"
++)
++
++// JetBox: служба не подключается сама, пока на этом компьютере не было ни одного успешного
++// входа (Login ключом или уже зарегистрированным ключом WG). Апстрим после перезапуска с
++// существующим профилем сразу идёт в management по умолчанию — для только что поставленного
++// JetBox это лишние обращения к серверу, о котором клиент не знает, и ложное «Подключаемся»
++// вместо NeedsLogin. Признак — файл в каталоге состояния; Logout его снимает.
++const jetboxRegisteredFile = "jetbox-registered"
++
++var (
++	// jetboxRequireLogin — переменная ради upstream-тестов сервера (jetbox_registered_test.go).
++	jetboxRequireLogin = true
++	// jetboxStateDir — каталог признака; переменная ради тестов.
++	jetboxStateDir = func() string { return configs.StateDir }
++)
++
++func jetboxRegisteredPath() string {
++	dir := jetboxStateDir()
++	if dir == "" {
++		return ""
++	}
++	return filepath.Join(dir, jetboxRegisteredFile)
++}
++
++// jetboxMayAutoConnect — можно ли подключаться при старте службы без команды приложения.
++func jetboxMayAutoConnect() bool {
++	if !jetboxRequireLogin {
++		return true
++	}
++	p := jetboxRegisteredPath()
++	if p == "" {
++		return true
++	}
++	_, err := os.Stat(p)
++	return err == nil
++}
++
++func jetboxMarkRegistered() {
++	p := jetboxRegisteredPath()
++	if p == "" {
++		return
++	}
++	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
++		log.Warnf("mark registered: %v", err)
++		return
++	}
++	if err := os.WriteFile(p, []byte("1\n"), 0o600); err != nil {
++		log.Warnf("mark registered: %v", err)
++	}
++}
++
++func jetboxClearRegistered() {
++	if p := jetboxRegisteredPath(); p != "" {
++		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
++			log.Warnf("clear registered mark: %v", err)
++		}
++	}
++}
+diff --git a/client/server/jetbox_registered_test.go b/client/server/jetbox_registered_test.go
+new file mode 100644
+index 0000000..a3b3d2f
+--- /dev/null
++++ b/client/server/jetbox_registered_test.go
+@@ -0,0 +1,48 @@
++package server
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// Upstream-тесты сервера рассчитаны на автоподключение апстрима; JetBox-тесты ниже включают
++// требование входа сами.
++func TestMain(m *testing.M) {
++	builtRequireLogin = jetboxRequireLogin
++	jetboxRequireLogin = false
++	os.Exit(m.Run())
++}
++
++var builtRequireLogin bool
++
++func withJetboxState(t *testing.T) string {
++	t.Helper()
++	dir := t.TempDir()
++	prevDir, prevReq := jetboxStateDir, jetboxRequireLogin
++	jetboxStateDir = func() string { return dir }
++	jetboxRequireLogin = true
++	t.Cleanup(func() { jetboxStateDir, jetboxRequireLogin = prevDir, prevReq })
++	return dir
++}
++
++func TestJetboxRequireLoginByDefault(t *testing.T) {
++	assert.True(t, builtRequireLogin, "сборка JetBox не должна автоподключаться до первого входа")
++}
++
++func TestJetboxNoAutoConnectBeforeFirstLogin(t *testing.T) {
++	dir := withJetboxState(t)
++	assert.False(t, jetboxMayAutoConnect(), "без входа — не подключаемся")
++
++	jetboxMarkRegistered()
++	_, err := os.Stat(filepath.Join(dir, jetboxRegisteredFile))
++	require.NoError(t, err)
++	assert.True(t, jetboxMayAutoConnect(), "после входа — подключаемся при старте, как апстрим")
++
++	jetboxClearRegistered()
++	assert.False(t, jetboxMayAutoConnect(), "после Logout — снова ждём входа")
++	jetboxClearRegistered() // повторно — без ошибки
++}
+diff --git a/client/server/server.go b/client/server/server.go
+index d5220bd..9606e20 100644
+--- a/client/server/server.go
++++ b/client/server/server.go
+@@ -343,6 +343,12 @@ func (s *Server) Start() error {
+ 		return nil
+ 	}
+ 
++	if !jetboxMayAutoConnect() {
++		log.Infof("not trying to connect: this device has not logged in yet")
++		state.Set(internal.StatusNeedsLogin)
++		return nil
++	}
++
+ 	s.clientRunning = true
+ 	s.clientRunningChan = make(chan struct{})
+ 	s.clientGiveUpChan = make(chan struct{})
+@@ -773,6 +779,7 @@ func (s *Server) Login(callerCtx context.Context, msg *proto.LoginRequest) (*pro
+ 		return nil, err
+ 	}
+ 	if !needsLogin {
++		jetboxMarkRegistered()
+ 		state.Set(internal.StatusIdle)
+ 		return &proto.LoginResponse{}, nil
+ 	}
+@@ -790,6 +797,7 @@ func (s *Server) Login(callerCtx context.Context, msg *proto.LoginRequest) (*pro
+ 		state.Set(loginStatus)
+ 		return nil, err
+ 	}
++	jetboxMarkRegistered()
+ 
+ 	return &proto.LoginResponse{}, nil
+ }
+@@ -1105,6 +1113,7 @@ func (s *Server) WaitSSOLogin(callerCtx context.Context, msg *proto.WaitSSOLogin
+ 		state.Set(loginStatus)
+ 		return nil, err
+ 	}
++	jetboxMarkRegistered()
+ 
+ 	log.Infof("SSO login flow finished, returning success to caller")
+ 	return &proto.WaitSSOLoginResponse{
+@@ -1601,6 +1610,7 @@ func (s *Server) cleanupAfterProfileLogout(id profilemanager.ID, username string
+ 	if !isActiveProfile(activeProf, id, username) {
+ 		return
+ 	}
++	jetboxClearRegistered()
+ 
+ 	if err := s.cleanupConnection(); err != nil && !errors.Is(err, ErrServiceNotUp) {
+ 		log.Errorf("failed to cleanup connection: %v", err)
+@@ -1628,6 +1638,7 @@ func (s *Server) handleActiveProfileLogout(ctx context.Context) (*proto.LogoutRe
+ 		log.Errorf("failed to send logout request: %v", err)
+ 		return nil, err
+ 	}
++	jetboxClearRegistered()
+ 
+ 	if err := s.cleanupConnection(); err != nil && !errors.Is(err, ErrServiceNotUp) {
+ 		// todo review to update the status in case any type of error

@@ -1,0 +1,10 @@
+upstream/
+build-out/
+*.local
+*.local.md
+*.p12
+*.pass
+node_modules/
+.claude/
+app/rsrc_windows_amd64.syso
+releases/

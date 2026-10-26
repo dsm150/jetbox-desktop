@@ -1,0 +1,339 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: JetBox build <build@jetbox.invalid>
+Date: Mon, 26 Oct 2026 15:11:52 +0300
+Subject: [PATCH] jetbox: do not send hardware identifiers or the system
+ hostname
+
+The service no longer collects the system serial number, model and
+manufacturer, reports network addresses without MAC, and never sends the
+OS hostname. The device name is the one the app passes in Login/Up
+(hostname); it is persisted in the state directory so peer metadata keeps
+it after restarts, with a neutral "JetBox" until one is set. OS, version
+and local IPs are sent as upstream does.
+---
+ client/server/server.go                     |  2 +
+ client/system/info_darwin.go                |  4 +-
+ client/system/info_windows.go               |  4 +-
+ client/system/jetbox_device_name.go         | 69 +++++++++++++++++++++
+ client/system/jetbox_device_name_test.go    | 58 +++++++++++++++++
+ client/system/jetbox_privacy.go             |  7 +++
+ client/system/jetbox_privacy_test.go        | 25 ++++++++
+ client/system/network_addr.go               |  5 +-
+ client/system/static_info_update.go         | 13 ++--
+ client/system/static_info_update_windows.go | 12 ++--
+ 10 files changed, 182 insertions(+), 17 deletions(-)
+ create mode 100644 client/system/jetbox_device_name.go
+ create mode 100644 client/system/jetbox_device_name_test.go
+ create mode 100644 client/system/jetbox_privacy.go
+ create mode 100644 client/system/jetbox_privacy_test.go
+
+diff --git a/client/server/server.go b/client/server/server.go
+index 4ce2a5c..d5220bd 100644
+--- a/client/server/server.go
++++ b/client/server/server.go
+@@ -741,6 +741,7 @@ func (s *Server) Login(callerCtx context.Context, msg *proto.LoginRequest) (*pro
+ 	if msg.Hostname != "" {
+ 		// nolint
+ 		ctx = context.WithValue(ctx, system.DeviceNameCtxKey, msg.Hostname)
++		system.SetDeviceName(msg.Hostname)
+ 	}
+ 
+ 	s.mutex.Unlock()
+@@ -982,6 +983,7 @@ func (s *Server) WaitSSOLogin(callerCtx context.Context, msg *proto.WaitSSOLogin
+ 	if msg.Hostname != "" {
+ 		// nolint
+ 		ctx = context.WithValue(ctx, system.DeviceNameCtxKey, msg.Hostname)
++		system.SetDeviceName(msg.Hostname)
+ 	}
+ 
+ 	s.actCancel = cancel
+diff --git a/client/system/info_darwin.go b/client/system/info_darwin.go
+index e7bf367..a66d227 100644
+--- a/client/system/info_darwin.go
++++ b/client/system/info_darwin.go
+@@ -5,7 +5,6 @@ package system
+ import (
+ 	"bytes"
+ 	"context"
+-	"os"
+ 	"os/exec"
+ 	"runtime"
+ 	"strings"
+@@ -64,8 +63,7 @@ func GetInfo(ctx context.Context) *Info {
+ 		Environment:        si.Environment,
+ 	}
+ 
+-	systemHostname, _ := os.Hostname()
+-	gio.Hostname = extractDeviceName(ctx, systemHostname)
++	gio.Hostname = extractDeviceName(ctx, deviceNameFallback())
+ 	gio.NetbirdVersion = version.NetbirdVersion()
+ 	gio.UIVersion = extractUserAgent(ctx)
+ 
+diff --git a/client/system/info_windows.go b/client/system/info_windows.go
+index d7f8f30..453f720 100644
+--- a/client/system/info_windows.go
++++ b/client/system/info_windows.go
+@@ -2,7 +2,6 @@ package system
+ 
+ import (
+ 	"context"
+-	"os"
+ 	"runtime"
+ 	"time"
+ 
+@@ -44,8 +43,7 @@ func GetInfo(ctx context.Context) *Info {
+ 		gio.NetworkAddresses = addrs
+ 	}
+ 
+-	systemHostname, _ := os.Hostname()
+-	gio.Hostname = extractDeviceName(ctx, systemHostname)
++	gio.Hostname = extractDeviceName(ctx, deviceNameFallback())
+ 	gio.NetbirdVersion = version.NetbirdVersion()
+ 	gio.UIVersion = extractUserAgent(ctx)
+ 	return gio
+diff --git a/client/system/jetbox_device_name.go b/client/system/jetbox_device_name.go
+new file mode 100644
+index 0000000..be5b260
+--- /dev/null
++++ b/client/system/jetbox_device_name.go
+@@ -0,0 +1,69 @@
++package system
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++
++	log "github.com/sirupsen/logrus"
++
++	"github.com/netbirdio/netbird/client/configs"
++)
++
++// JetBox: системное имя компьютера (os.Hostname — обычно «MacBook-Air-<Имя>», имя ПК Windows)
++// на management не уходит. Имя устройства — только то, что приложение передало в Login/Up
++// (`hostname`); служба запоминает его в каталоге состояния, чтобы и после перезапуска в
++// метаданных было оно, а не системное. Ни разу не задано — нейтральное jetboxFallbackDeviceName.
++const (
++	jetboxDeviceNameFile     = "jetbox-device-name"
++	jetboxFallbackDeviceName = "JetBox"
++)
++
++var (
++	jetboxDeviceNameMu     sync.Mutex
++	jetboxDeviceNameLoaded bool
++	jetboxDeviceName       string
++	// jetboxStateDir — каталог, где лежит имя; переменная ради тестов.
++	jetboxStateDir = func() string { return configs.StateDir }
++)
++
++// SetDeviceName запоминает имя устройства, переданное приложением в Login/Up.
++func SetDeviceName(name string) {
++	name = strings.TrimSpace(name)
++	if name == "" {
++		return
++	}
++	jetboxDeviceNameMu.Lock()
++	defer jetboxDeviceNameMu.Unlock()
++	jetboxDeviceName, jetboxDeviceNameLoaded = name, true
++	dir := jetboxStateDir()
++	if dir == "" {
++		return
++	}
++	if err := os.MkdirAll(dir, 0o700); err != nil {
++		log.Warnf("save device name: %v", err)
++		return
++	}
++	if err := os.WriteFile(filepath.Join(dir, jetboxDeviceNameFile), []byte(name), 0o600); err != nil {
++		log.Warnf("save device name: %v", err)
++	}
++}
++
++// deviceNameFallback — имя устройства, когда в контексте вызова его нет.
++func deviceNameFallback() string {
++	jetboxDeviceNameMu.Lock()
++	defer jetboxDeviceNameMu.Unlock()
++	if !jetboxDeviceNameLoaded {
++		jetboxDeviceNameLoaded = true
++		if dir := jetboxStateDir(); dir != "" {
++			if b, err := os.ReadFile(filepath.Join(dir, jetboxDeviceNameFile)); err == nil {
++				jetboxDeviceName = strings.TrimSpace(string(b))
++			}
++		}
++	}
++	if jetboxDeviceName != "" {
++		return jetboxDeviceName
++	}
++	return jetboxFallbackDeviceName
++}
+diff --git a/client/system/jetbox_device_name_test.go b/client/system/jetbox_device_name_test.go
+new file mode 100644
+index 0000000..fc2b97a
+--- /dev/null
++++ b/client/system/jetbox_device_name_test.go
+@@ -0,0 +1,58 @@
++//go:build (darwin && !ios) || windows
++
++package system
++
++import (
++	"context"
++	"os"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func withStateDir(t *testing.T) string {
++	t.Helper()
++	dir := t.TempDir()
++	prev := jetboxStateDir
++	jetboxStateDir = func() string { return dir }
++	jetboxDeviceNameMu.Lock()
++	jetboxDeviceName, jetboxDeviceNameLoaded = "", false
++	jetboxDeviceNameMu.Unlock()
++	t.Cleanup(func() {
++		jetboxStateDir = prev
++		jetboxDeviceNameMu.Lock()
++		jetboxDeviceName, jetboxDeviceNameLoaded = "", false
++		jetboxDeviceNameMu.Unlock()
++	})
++	return dir
++}
++
++// Системное имя компьютера в метаданные не попадает — без имени от приложения уходит «JetBox».
++func TestJetboxNoSystemHostname(t *testing.T) {
++	withStateDir(t)
++	sys, _ := os.Hostname()
++	got := GetInfo(context.Background()).Hostname
++	assert.Equal(t, jetboxFallbackDeviceName, got)
++	if sys != "" {
++		assert.NotContains(t, strings.ToLower(got), strings.ToLower(strings.TrimSuffix(sys, ".local")))
++	}
++}
++
++// Имя из Login/Up запоминается и переживает перезапуск службы (читается из каталога состояния).
++func TestJetboxDeviceNamePersists(t *testing.T) {
++	withStateDir(t)
++	SetDeviceName("  Компьютер Ивана  ")
++	assert.Equal(t, "Компьютер Ивана", GetInfo(context.Background()).Hostname)
++
++	// «Перезапуск»: память сброшена, файл остался.
++	jetboxDeviceNameMu.Lock()
++	jetboxDeviceName, jetboxDeviceNameLoaded = "", false
++	jetboxDeviceNameMu.Unlock()
++	assert.Equal(t, "Компьютер Ивана", GetInfo(context.Background()).Hostname)
++
++	// Имя из контекста вызова (Login/Up) — главнее запомненного.
++	ctx := context.WithValue(context.Background(), DeviceNameCtxKey, "Другое имя")
++	require.Equal(t, "Другое имя", GetInfo(ctx).Hostname)
++}
+diff --git a/client/system/jetbox_privacy.go b/client/system/jetbox_privacy.go
+new file mode 100644
+index 0000000..1e98c20
+--- /dev/null
++++ b/client/system/jetbox_privacy.go
+@@ -0,0 +1,7 @@
++package system
++
++// JetBox: служба не отправляет на management аппаратные идентификаторы компьютера —
++// серийный номер, модель/производителя и MAC-адреса. Остальное (ОС, версия, имя
++// устройства, локальные IP) — как у апстрима. Так обещает политика конфиденциальности
++// JetBox («аппаратных идентификаторов не собираем»).
++const jetboxCollectHardwareIDs = false
+diff --git a/client/system/jetbox_privacy_test.go b/client/system/jetbox_privacy_test.go
+new file mode 100644
+index 0000000..30db2a1
+--- /dev/null
++++ b/client/system/jetbox_privacy_test.go
+@@ -0,0 +1,25 @@
++//go:build (darwin && !ios) || windows || (linux && !android)
++
++package system
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestJetboxNoHardwareIDsInStaticInfo(t *testing.T) {
++	si := newStaticInfo()
++	assert.Empty(t, si.SystemSerialNumber, "серийный номер не должен собираться")
++	assert.Empty(t, si.SystemProductName, "модель не должна собираться")
++	assert.Empty(t, si.SystemManufacturer, "производитель не должен собираться")
++}
++
++func TestJetboxNoMACInNetworkAddresses(t *testing.T) {
++	addrs, err := networkAddresses()
++	assert.NoError(t, err)
++	for _, a := range addrs {
++		assert.Empty(t, a.Mac, "MAC не должен уходить на management (%s)", a.NetIP)
++	}
++	t.Logf("адресов: %d", len(addrs))
++}
+diff --git a/client/system/network_addr.go b/client/system/network_addr.go
+index 505a6f0..205269b 100644
+--- a/client/system/network_addr.go
++++ b/client/system/network_addr.go
+@@ -26,7 +26,10 @@ func networkAddresses() ([]NetworkAddress, error) {
+ 			continue
+ 		}
+ 
+-		mac := iface.HardwareAddr.String()
++		mac := ""
++		if jetboxCollectHardwareIDs {
++			mac = iface.HardwareAddr.String()
++		}
+ 		for _, address := range addrs {
+ 			netAddr, ok := toNetworkAddress(address, mac)
+ 			if !ok {
+diff --git a/client/system/static_info_update.go b/client/system/static_info_update.go
+index af8b1e2..e41740a 100644
+--- a/client/system/static_info_update.go
++++ b/client/system/static_info_update.go
+@@ -17,11 +17,14 @@ func newStaticInfo() StaticInfo {
+ 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+ 	defer cancel()
+ 	wg := sync.WaitGroup{}
+-	wg.Add(3)
+-	go func() {
+-		si.SystemSerialNumber, si.SystemProductName, si.SystemManufacturer = sysInfo()
+-		wg.Done()
+-	}()
++	wg.Add(2)
++	if jetboxCollectHardwareIDs {
++		wg.Add(1)
++		go func() {
++			si.SystemSerialNumber, si.SystemProductName, si.SystemManufacturer = sysInfo()
++			wg.Done()
++		}()
++	}
+ 	go func() {
+ 		si.Environment.Cloud = detect_cloud.Detect(ctx)
+ 		wg.Done()
+diff --git a/client/system/static_info_update_windows.go b/client/system/static_info_update_windows.go
+index 5f232c1..98db933 100644
+--- a/client/system/static_info_update_windows.go
++++ b/client/system/static_info_update_windows.go
+@@ -37,11 +37,13 @@ func newStaticInfo() StaticInfo {
+ 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+ 	defer cancel()
+ 	wg := sync.WaitGroup{}
+-	wg.Add(1)
+-	go func() {
+-		si.SystemSerialNumber, si.SystemProductName, si.SystemManufacturer = sysInfo()
+-		wg.Done()
+-	}()
++	if jetboxCollectHardwareIDs {
++		wg.Add(1)
++		go func() {
++			si.SystemSerialNumber, si.SystemProductName, si.SystemManufacturer = sysInfo()
++			wg.Done()
++		}()
++	}
+ 	wg.Add(1)
+ 	go func() {
+ 		si.Environment.Cloud = detect_cloud.Detect(ctx)

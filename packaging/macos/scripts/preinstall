@@ -1,0 +1,24 @@
+#!/bin/sh
+# Перед установкой/обновлением JetBox: закрыть приложение и остановить службу, чтобы файлы
+# заменились целиком. Состояние службы (/var/lib/jetbox) не трогаем — после обновления
+# компьютер остаётся подключённым к тому же JetBox.
+LABEL=net.jet-net.jetbox.daemon
+AGENT=net.jet-net.jetbox.desktop
+LOG=/var/log/jetbox/install.log
+. "$(dirname "$0")/launchd.sh"
+mkdir -p /var/log/jetbox
+{
+  echo "$(date '+%F %T') preinstall"
+  user=$(stat -f%Su /dev/console 2>/dev/null)
+  case "$user" in
+    ""|root|loginwindow|_mbsetupuser) ;;
+    *)
+      uid=$(id -u "$user")
+      jb_unload "gui/$uid/$AGENT" || true
+      launchctl asuser "$uid" sudo -u "$user" osascript -e 'quit app id "net.jet-net.jetbox.desktop"' 2>/dev/null || true ;;
+  esac
+  sleep 1
+  pkill -x JetBox 2>/dev/null || true
+  jb_unload "system/$LABEL" || true
+  exit 0
+} >>"$LOG" 2>&1

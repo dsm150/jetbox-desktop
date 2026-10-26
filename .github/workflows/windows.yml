@@ -1,0 +1,101 @@
+# Windows release build: JetBox.exe, jetboxd.exe (NetBird v0.81.4 + daemon/patches) and the NSIS installer,
+# fully from this repository's sources. Tag format: v<X.Y.Z>-b<build>, e.g. v1.0.2-b4.
+name: windows
+
+on:
+  push:
+    tags: ["v*.*.*-b*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version X.Y.Z"
+        required: true
+        default: "0.0.0"
+      build:
+        description: "Build number"
+        required: true
+        default: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            tag=${GITHUB_REF_NAME#v}
+            version=${tag%-b*}
+            build=${tag##*-b}
+          else
+            version='${{ inputs.version }}'
+            build='${{ inputs.build }}'
+          fi
+          printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "bad version: $version"; exit 1; }
+          printf '%s\n' "$build" | grep -Eq '^[0-9]+$' || { echo "bad build: $build"; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "BUILD=$build" >> "$GITHUB_ENV"
+          # One product version in every file: app, service and installer (X.Y.Z.B).
+          echo "JETBOX_PRODUCT_VERSION=$version.$build" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: app/frontend/pnpm-lock.yaml
+
+      - name: NSIS
+        run: |
+          if ! command -v makensis >/dev/null 2>&1; then
+            [ -x "/c/Program Files (x86)/NSIS/makensis.exe" ] || choco install nsis -y --no-progress
+            echo "/c/Program Files (x86)/NSIS" >> "$GITHUB_PATH"
+          fi
+
+      - name: Tests
+        run: |
+          (cd app/frontend && pnpm install --frozen-lockfile --ignore-scripts && pnpm build)
+          go vet ./core/... ./app/...
+          go test -count=1 ./core/... ./app/...
+
+      - name: Service (upstream tag + patches)
+        run: sh daemon/scripts/build.sh windows
+
+      - name: App
+        run: sh app/build.sh windows "$VERSION" "$BUILD"
+
+      - name: Installer
+        run: |
+          # wails3 CLI only extracts the Microsoft WebView2 bootstrapper (same as upstream NetBird CI).
+          (cd "$RUNNER_TEMP" && GOBIN="$RUNNER_TEMP/bin" go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.3)
+          WAILS3="$RUNNER_TEMP/bin/wails3.exe" sh packaging/windows/build.sh "$VERSION" "$BUILD"
+
+      - name: Checksums
+        run: |
+          cd build-out/windows-amd64
+          sha256sum JetBox.exe jetboxd.exe JetBox-Setup.exe | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jetbox-windows-${{ env.VERSION }}-b${{ env.BUILD }}
+          path: |
+            build-out/windows-amd64/JetBox.exe
+            build-out/windows-amd64/jetboxd.exe
+            build-out/windows-amd64/JetBox-Setup.exe
+            build-out/windows-amd64/SHA256SUMS
+          if-no-files-found: error

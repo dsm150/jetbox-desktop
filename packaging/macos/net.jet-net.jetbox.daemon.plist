@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Служба JetBox под launchd (root). Имена — как в daemon/brand.env и core/platform.
+  NB_ROUTE_PROTO_FLAG=2: свои метки маршрутов — при старте служба не сносит маршруты
+  официального NetBird (у него RTF_PROTO1). NB_METRICS_PUSH_ENABLED=false: явный запрет
+  отправки метрик на ingest.netbird.io (иначе management мог бы его включить).
+  NB_LOG_MAX_SIZE_MB=5: лог службы ротируется апстримом (10 файлов, 30 дней) — с 5 МБ это не больше
+  ~55 МБ на диске (по умолчанию 15 МБ → ~165 МБ; на ROOT со 140 пирами лог растёт ~1 МБ/ч).
+  Служба лежит вне бандла (root:wheel) — её не подменить без пароля, и она не пропадает,
+  если приложение перетащили в корзину. Канал 0666 служба создаёт сама: приложение
+  пользователя подключается без прав администратора.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>net.jet-net.jetbox.daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Library/Application Support/JetBox/jetboxd</string>
+		<string>service</string>
+		<string>run</string>
+		<string>--log-level</string>
+		<string>info</string>
+		<string>--daemon-addr</string>
+		<string>unix:///var/run/jetbox.sock</string>
+		<string>--log-file</string>
+		<string>/var/log/jetbox/client.log</string>
+		<string>--disable-profiles</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>NB_STATE_DIR</key>
+		<string>/var/lib/jetbox</string>
+		<key>NB_DNS_STATE_FILE</key>
+		<string>/var/lib/jetbox/state.json</string>
+		<key>NB_ROUTE_PROTO_FLAG</key>
+		<string>2</string>
+		<key>NB_METRICS_PUSH_ENABLED</key>
+		<string>false</string>
+		<key>NB_LOG_MAX_SIZE_MB</key>
+		<string>5</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>/var/log/jetbox/daemon.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/jetbox/daemon.err.log</string>
+</dict>
+</plist>

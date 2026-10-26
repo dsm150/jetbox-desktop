@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: JetBox build <build@jetbox.invalid>
+Date: Mon, 26 Oct 2026 15:11:14 +0300
+Subject: [PATCH] jetbox: disable upstream auto-update
+
+JetBox service never polls pkgs.netbird.io, ignores the management
+"expected version / force update" directive and never downloads or runs
+the NetBird installer. Otherwise a JetBox computer would silently turn into
+an official NetBird install. JetBox ships its own update channel.
+---
+ client/internal/updater/jetbox_disabled.go    | 12 +++
+ .../internal/updater/jetbox_disabled_test.go  | 83 +++++++++++++++++++
+ client/internal/updater/manager.go            | 17 ++++
+ 3 files changed, 112 insertions(+)
+ create mode 100644 client/internal/updater/jetbox_disabled.go
+ create mode 100644 client/internal/updater/jetbox_disabled_test.go
+
+diff --git a/client/internal/updater/jetbox_disabled.go b/client/internal/updater/jetbox_disabled.go
+new file mode 100644
+index 0000000..d942a3e
+--- /dev/null
++++ b/client/internal/updater/jetbox_disabled.go
+@@ -0,0 +1,12 @@
++package updater
++
++// JetBox: автообновление апстрима вырезано. Служба JetBox не проверяет версии на
++// pkgs.netbird.io, не реагирует на директиву management «expected version / force update»
++// и никогда не скачивает и не запускает установщик NetBird — иначе на компьютере клиента
++// JetBox молча превратился бы в официальный NetBird. Своё обновление JetBox — отдельно.
++//
++// Переменная, а не константа, только ради upstream-тестов логики менеджера
++// (jetbox_disabled_test.go включает её обратно в TestMain).
++const defaultJetboxUpdatesDisabled = true
++
++var jetboxUpdatesDisabled = defaultJetboxUpdatesDisabled
+diff --git a/client/internal/updater/jetbox_disabled_test.go b/client/internal/updater/jetbox_disabled_test.go
+new file mode 100644
+index 0000000..9da348b
+--- /dev/null
++++ b/client/internal/updater/jetbox_disabled_test.go
+@@ -0,0 +1,83 @@
++package updater
++
++import (
++	"context"
++	"os"
++	"path"
++	"testing"
++	"time"
++
++	v "github.com/hashicorp/go-version"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/netbirdio/netbird/client/internal/peer"
++	"github.com/netbirdio/netbird/client/internal/statemanager"
++)
++
++// Upstream-тесты проверяют логику менеджера с включённым обновлением; JetBox-тесты ниже
++// явно включают запрет на время своего прогона.
++func TestMain(m *testing.M) {
++	builtDisabled = jetboxUpdatesDisabled
++	jetboxUpdatesDisabled = false
++	os.Exit(m.Run())
++}
++
++// builtDisabled — значение переменной в собранном пакете (до переключения в TestMain).
++var builtDisabled bool
++
++func newTestManager(t *testing.T, current string) (*Manager, *versionUpdateMock) {
++	t.Helper()
++	mock := &versionUpdateMock{latestVersion: v.Must(v.NewSemver("99.0.0"))}
++	m := NewManager(peer.NewRecorder(""), statemanager.New(path.Join(t.TempDir(), "state.json")))
++	m.update = mock
++	m.currentVersion = current
++	return m, mock
++}
++
++func withJetboxDisabled(t *testing.T) {
++	t.Helper()
++	jetboxUpdatesDisabled = true
++	t.Cleanup(func() { jetboxUpdatesDisabled = false })
++}
++
++func TestJetboxDisabledByDefault(t *testing.T) {
++	assert.True(t, defaultJetboxUpdatesDisabled, "сборка JetBox обязана выходить с вырезанным автообновлением")
++	assert.True(t, builtDisabled, "переменная jetboxUpdatesDisabled в сборке должна быть true")
++}
++
++func TestJetboxForceUpdateDirectiveIgnored(t *testing.T) {
++	withJetboxDisabled(t)
++	m, _ := newTestManager(t, "0.1.0")
++	m.autoUpdateSupported = func() bool { return true }
++
++	m.SetVersion("latest", true)
++	m.SetVersion("99.0.0", true)
++	m.SetDownloadOnly()
++
++	m.updateMutex.Lock()
++	defer m.updateMutex.Unlock()
++	assert.Equal(t, modeUndecided, m.mode, "директива management не должна переключать режим")
++	assert.Nil(t, m.expectedVersion)
++	assert.False(t, m.forceUpdate)
++	assert.Empty(t, m.mgmUpdateChan, "в цикл обновления ничего не должно уйти")
++}
++
++func TestJetboxInstallRefused(t *testing.T) {
++	withJetboxDisabled(t)
++	m, _ := newTestManager(t, "0.1.0")
++	m.autoUpdateSupported = func() bool { return true }
++	m.pendingVersion = v.Must(v.NewVersion("99.0.0"))
++
++	require.Error(t, m.Install(context.Background()))
++	require.Error(t, m.tryInstall(context.Background(), v.Must(v.NewVersion("99.0.0"))))
++}
++
++func TestJetboxStartDoesNotFetch(t *testing.T) {
++	withJetboxDisabled(t)
++	m, _ := newTestManager(t, "0.1.0")
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	m.Start(ctx)
++	assert.Nil(t, m.cancel, "менеджер не должен запускать цикл и опрос pkgs.netbird.io")
++}
+diff --git a/client/internal/updater/manager.go b/client/internal/updater/manager.go
+index c730713..114961d 100644
+--- a/client/internal/updater/manager.go
++++ b/client/internal/updater/manager.go
+@@ -131,6 +131,10 @@ func (m *Manager) CheckUpdateSuccess(ctx context.Context) {
+ }
+ 
+ func (m *Manager) Start(ctx context.Context) {
++	if jetboxUpdatesDisabled {
++		log.Infof("auto-update is disabled in this build")
++		return
++	}
+ 	log.Infof("starting update manager")
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+@@ -158,6 +162,9 @@ func (m *Manager) Start(ctx context.Context) {
+ }
+ 
+ func (m *Manager) SetDownloadOnly() {
++	if jetboxUpdatesDisabled {
++		return
++	}
+ 	m.updateMutex.Lock()
+ 	m.setModeLocked(modeDownloadOnly)
+ 	m.updateMutex.Unlock()
+@@ -169,6 +176,10 @@ func (m *Manager) SetDownloadOnly() {
+ }
+ 
+ func (m *Manager) SetVersion(expectedVersion string, forceUpdate bool) {
++	if jetboxUpdatesDisabled {
++		log.Infof("ignoring update directive (expected version %q, force %t): auto-update is disabled in this build", expectedVersion, forceUpdate)
++		return
++	}
+ 	log.Infof("expected version changed to %s, force update: %t", expectedVersion, forceUpdate)
+ 
+ 	if !m.autoUpdateSupported() {
+@@ -225,6 +236,9 @@ func (m *Manager) ResetMode() {
+ 
+ // Install triggers the installation of the pending version. It is called when the user clicks the install button in the UI.
+ func (m *Manager) Install(ctx context.Context) error {
++	if jetboxUpdatesDisabled {
++		return fmt.Errorf("auto-update is disabled in this build")
++	}
+ 	if !m.autoUpdateSupported() {
+ 		return fmt.Errorf("auto-update not supported on this platform")
+ 	}
+@@ -243,6 +257,9 @@ func (m *Manager) Install(ctx context.Context) error {
+ // tryInstall ensures only one installation runs at a time. Concurrent callers
+ // receive an error immediately rather than queuing behind a running install.
+ func (m *Manager) tryInstall(ctx context.Context, targetVersion *v.Version) error {
++	if jetboxUpdatesDisabled {
++		return fmt.Errorf("auto-update is disabled in this build")
++	}
+ 	m.installMutex.Lock()
+ 	if m.installing {
+ 		m.installMutex.Unlock()

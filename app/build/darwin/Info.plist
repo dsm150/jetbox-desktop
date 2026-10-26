@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>JetBox</string>
+  <key>CFBundleDisplayName</key><string>JetBox</string>
+  <key>CFBundleIdentifier</key><string>net.jet-net.jetbox.desktop</string>
+  <key>CFBundleExecutable</key><string>JetBox</string>
+  <key>CFBundleIconFile</key><string>JetBox</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>__VERSION__</string>
+  <key>CFBundleVersion</key><string>__BUILD__</string>
+  <key>LSMinimumSystemVersion</key><string>__MINOS__</string>
+  <key>LSUIElement</key><true/>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSHumanReadableCopyright</key><string>© 2026 JetNet</string>
+  <key>CFBundleDevelopmentRegion</key><string>ru</string>
+  <key>CFBundleLocalizations</key><array><string>ru</string><string>en</string></array>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>net.jet-net.jetbox.desktop.connect</string>
+      <key>CFBundleURLSchemes</key><array><string>jetbox</string></array>
+    </dict>
+  </array>
+</dict>
+</plist>

@@ -1,0 +1,794 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: JetBox build <build@jetbox.invalid>
+Date: Mon, 26 Oct 2026 15:15:59 +0300
+Subject: [PATCH] jetbox: make system-visible names build-time variables
+
+New package client/jetboxbrand holds the names the service leaves in the
+system or shares with an official NetBird installed on the same computer:
+service name/display name/description, Windows firewall rule, NRPT key
+prefix, macOS scutil key prefix, data directories (state default, panic
+log, tmp-install), UPnP mapping description, the legacy config directory
+copied on first start, CLI defaults (daemon address, log and run dirs),
+MDM policy location (macOS plist, Windows registry), the ssh_config.d file
+and the launchd logs collected by the debug bundle.
+
+Defaults equal upstream; JetBox builds set them with -ldflags -X.
+---
+ client/cmd/root.go                            | 15 ++-
+ client/cmd/service.go                         |  9 +-
+ client/configs/configs.go                     |  6 +-
+ .../uspfilter/interface_allower_windows.go    |  9 +-
+ client/iface/device/jetbox_guid_test.go       | 18 ++++
+ client/internal/daemonaddr/resolve.go         |  4 +-
+ client/internal/debug/debug.go                | 10 +-
+ client/internal/dns/host_darwin.go            | 10 +-
+ client/internal/dns/host_windows.go           | 29 +++---
+ .../internal/dns/jetbox_scutil_darwin_test.go | 22 +++++
+ client/internal/portforward/manager.go        |  5 +-
+ client/internal/profilemanager/config.go      | 13 ++-
+ .../profilemanager/jetbox_legacy_test.go      | 18 ++++
+ client/internal/profilemanager/service.go     |  8 +-
+ .../updater/installer/installer_run_darwin.go |  6 +-
+ .../installer/installer_run_windows.go        |  4 +-
+ client/jetboxbrand/brand.go                   | 70 ++++++++++++++
+ client/jetboxbrand/brand_test.go              | 96 +++++++++++++++++++
+ client/mdm/policy_darwin.go                   |  7 +-
+ client/mdm/policy_windows.go                  |  6 +-
+ client/server/panic_windows.go                |  4 +-
+ client/ssh/common.go                          |  8 +-
+ 22 files changed, 333 insertions(+), 44 deletions(-)
+ create mode 100644 client/iface/device/jetbox_guid_test.go
+ create mode 100644 client/internal/dns/jetbox_scutil_darwin_test.go
+ create mode 100644 client/internal/profilemanager/jetbox_legacy_test.go
+ create mode 100644 client/jetboxbrand/brand.go
+ create mode 100644 client/jetboxbrand/brand_test.go
+
+diff --git a/client/cmd/root.go b/client/cmd/root.go
+index 51179f7..ed3ca18 100644
+--- a/client/cmd/root.go
++++ b/client/cmd/root.go
+@@ -27,6 +27,8 @@ import (
+ 	daddr "github.com/netbirdio/netbird/client/internal/daemonaddr"
+ 	"github.com/netbirdio/netbird/client/internal/localmetrics"
+ 	"github.com/netbirdio/netbird/client/internal/profilemanager"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ const (
+@@ -127,16 +129,16 @@ func Execute() error {
+ // maps, custom DNS resolver address, Rosenpass options, auto-connect
+ // disabling, lazy connection).
+ func init() {
+-	defaultConfigPathDir = "/etc/netbird/"
+-	defaultLogFileDir = "/var/log/netbird/"
++	defaultConfigPathDir = jetboxbrand.LegacyUnixConfigDir
++	defaultLogFileDir = jetboxbrand.UnixLogDir
+ 
+ 	oldDefaultConfigPathDir = "/etc/wiretrustee/"
+ 	oldDefaultLogFileDir = "/var/log/wiretrustee/"
+ 
+ 	switch runtime.GOOS {
+ 	case "windows":
+-		defaultConfigPathDir = os.Getenv("PROGRAMDATA") + "\\Netbird\\"
+-		defaultLogFileDir = os.Getenv("PROGRAMDATA") + "\\Netbird\\"
++		defaultConfigPathDir = os.Getenv("PROGRAMDATA") + "\\" + jetboxbrand.WindowsDataDirName + "\\"
++		defaultLogFileDir = os.Getenv("PROGRAMDATA") + "\\" + jetboxbrand.WindowsDataDirName + "\\"
+ 
+ 		oldDefaultConfigPathDir = os.Getenv("PROGRAMDATA") + "\\Wiretrustee\\"
+ 		oldDefaultLogFileDir = os.Getenv("PROGRAMDATA") + "\\Wiretrustee\\"
+@@ -150,9 +152,12 @@ func init() {
+ 	oldDefaultConfigPath = oldDefaultConfigPathDir + "config.json"
+ 	oldDefaultLogFile = oldDefaultLogFileDir + "client.log"
+ 
+-	defaultDaemonAddr := "unix:///var/run/netbird.sock"
++	defaultDaemonAddr := jetboxbrand.DaemonAddrUnix
+ 	if runtime.GOOS == "windows" {
+ 		defaultDaemonAddr = daddr.WindowsPipeAddr
++		if jetboxbrand.DaemonAddrWindows != "" {
++			defaultDaemonAddr = jetboxbrand.DaemonAddrWindows
++		}
+ 	}
+ 
+ 	rootCmd.PersistentFlags().StringVar(&daemonAddr, "daemon-addr", defaultDaemonAddr, "Daemon service address to serve CLI requests [unix|tcp|npipe]://[path|host:port|name]")
+diff --git a/client/cmd/service.go b/client/cmd/service.go
+index 2a558e6..1f3a847 100644
+--- a/client/cmd/service.go
++++ b/client/cmd/service.go
+@@ -17,6 +17,8 @@ import (
+ 
+ 	"github.com/netbirdio/netbird/client/internal"
+ 	"github.com/netbirdio/netbird/client/server"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ var serviceCmd = &cobra.Command{
+@@ -77,6 +79,9 @@ func init() {
+ 	if runtime.GOOS == "windows" {
+ 		defaultServiceName = "Netbird"
+ 	}
++	if jetboxbrand.ServiceName != "" {
++		defaultServiceName = jetboxbrand.ServiceName
++	}
+ 
+ 	serviceCmd.AddCommand(runCmd, startCmd, stopCmd, restartCmd, svcStatusCmd, installCmd, uninstallCmd, reconfigureCmd, resetParamsCmd)
+ 	serviceCmd.PersistentFlags().BoolVar(&profilesDisabled, "disable-profiles", false, "Disables profiles feature. If enabled, the client will not be able to change or edit any profile. To persist this setting, use: netbird service install --disable-profiles")
+@@ -107,8 +112,8 @@ func newProgram(ctx context.Context, cancel context.CancelFunc) *program {
+ func newSVCConfig() (*service.Config, error) {
+ 	config := &service.Config{
+ 		Name:        serviceName,
+-		DisplayName: "Netbird",
+-		Description: "NetBird mesh network client",
++		DisplayName: jetboxbrand.ServiceDisplayName,
++		Description: jetboxbrand.ServiceDescription,
+ 		Option:      make(service.KeyValue),
+ 		EnvVars:     make(map[string]string),
+ 	}
+diff --git a/client/configs/configs.go b/client/configs/configs.go
+index a1ecf0f..913e805 100644
+--- a/client/configs/configs.go
++++ b/client/configs/configs.go
+@@ -4,6 +4,8 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"runtime"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ // UILogFile is the file name the desktop UI writes its log to. It is defined
+@@ -20,9 +22,9 @@ func init() {
+ 	}
+ 	switch runtime.GOOS {
+ 	case "windows":
+-		StateDir = filepath.Join(os.Getenv("PROGRAMDATA"), "Netbird")
++		StateDir = filepath.Join(os.Getenv("PROGRAMDATA"), jetboxbrand.WindowsDataDirName)
+ 	case "darwin", "linux":
+-		StateDir = "/var/lib/netbird"
++		StateDir = jetboxbrand.UnixDataDir
+ 	case "freebsd", "openbsd", "netbsd", "dragonfly":
+ 		StateDir = "/var/db/netbird"
+ 	}
+diff --git a/client/firewall/uspfilter/interface_allower_windows.go b/client/firewall/uspfilter/interface_allower_windows.go
+index 4cd0fe9..39eb5df 100644
+--- a/client/firewall/uspfilter/interface_allower_windows.go
++++ b/client/firewall/uspfilter/interface_allower_windows.go
+@@ -10,16 +10,19 @@ import (
+ 
+ 	nberrors "github.com/netbirdio/netbird/client/errors"
+ 	"github.com/netbirdio/netbird/client/internal/wincmd"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ type action string
+ 
+ const (
+-	addRule          action = "add"
+-	deleteRule       action = "delete"
+-	firewallRuleName        = "Netbird"
++	addRule    action = "add"
++	deleteRule action = "delete"
+ )
+ 
++var firewallRuleName = jetboxbrand.FirewallRuleName
++
+ // WindowsInterfaceAllower opens the NetBird interface in the Windows firewall
+ // via netsh advfirewall rules. It implements InterfaceAllower for the userspace
+ // firewall on Windows.
+diff --git a/client/iface/device/jetbox_guid_test.go b/client/iface/device/jetbox_guid_test.go
+new file mode 100644
+index 0000000..e8b4a10
+--- /dev/null
++++ b/client/iface/device/jetbox_guid_test.go
+@@ -0,0 +1,18 @@
++package device
++
++import (
++	"os"
++	"testing"
++)
++
++// daemon/scripts/test.sh передаёт ожидаемый GUID адаптера Windows (JETBOX_EXPECT_GUID) вместе
++// с теми же -ldflags, что и сборка: опечатку в пути -X линкер молча пропускает.
++func TestJetboxWindowsGUIDFlag(t *testing.T) {
++	want := os.Getenv("JETBOX_EXPECT_GUID")
++	if want == "" {
++		t.Skip("нет JETBOX_EXPECT_GUID")
++	}
++	if CustomWindowsGUIDString != want {
++		t.Fatalf("CustomWindowsGUIDString = %q, ждали %q (путь -X не тот?)", CustomWindowsGUIDString, want)
++	}
++}
+diff --git a/client/internal/daemonaddr/resolve.go b/client/internal/daemonaddr/resolve.go
+index b445696..2255d66 100644
+--- a/client/internal/daemonaddr/resolve.go
++++ b/client/internal/daemonaddr/resolve.go
+@@ -8,9 +8,11 @@ import (
+ 	"strings"
+ 
+ 	log "github.com/sirupsen/logrus"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+-var scanDir = "/var/run/netbird"
++var scanDir = jetboxbrand.UnixRunDir
+ 
+ // setScanDir overrides the scan directory (used by tests).
+ func setScanDir(dir string) {
+diff --git a/client/internal/debug/debug.go b/client/internal/debug/debug.go
+index 95419b0..374a8c8 100644
+--- a/client/internal/debug/debug.go
++++ b/client/internal/debug/debug.go
+@@ -32,6 +32,8 @@ import (
+ 	nbstatus "github.com/netbirdio/netbird/client/status"
+ 	mgmProto "github.com/netbirdio/netbird/shared/management/proto"
+ 	"github.com/netbirdio/netbird/shared/netiputil"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ const readmeContent = `This debug bundle contains the following files.
+@@ -257,9 +259,13 @@ const (
+ 	// dir, so the prefixes must be disjoint to keep their rotated siblings apart.
+ 	clientLogPrefix = "client"
+ 	uiLogPrefix     = "gui-client"
++)
+ 
+-	darwinErrorLogPath  = "/var/log/netbird.out.log"
+-	darwinStdoutLogPath = "/var/log/netbird.err.log"
++// JetBox: пути задаются при сборке (jetboxbrand) — отладочный пакет собирает логи своей
++// службы, а не официального NetBird. Соответствие имён — как у апстрима.
++var (
++	darwinErrorLogPath  = jetboxbrand.DarwinLaunchdStdoutLog
++	darwinStdoutLogPath = jetboxbrand.DarwinLaunchdStderrLog
+ )
+ 
+ // MetricsExporter is an interface for exporting metrics
+diff --git a/client/internal/dns/host_darwin.go b/client/internal/dns/host_darwin.go
+index 8102975..0e9d8bd 100644
+--- a/client/internal/dns/host_darwin.go
++++ b/client/internal/dns/host_darwin.go
+@@ -20,11 +20,17 @@ import (
+ 	"golang.org/x/exp/maps"
+ 
+ 	"github.com/netbirdio/netbird/client/internal/statemanager"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
++)
++
++// JetBox: префикс ключей задаётся при сборке (jetboxbrand.ScutilKeyPrefix), поэтому var.
++var (
++	netbirdDNSStateKeyFormat        = "State:/Network/Service/" + jetboxbrand.ScutilKeyPrefix + "%s/DNS"
++	netbirdDNSStateKeyIndexedFormat = "State:/Network/Service/" + jetboxbrand.ScutilKeyPrefix + "%s-%d/DNS"
+ )
+ 
+ const (
+-	netbirdDNSStateKeyFormat            = "State:/Network/Service/NetBird-%s/DNS"
+-	netbirdDNSStateKeyIndexedFormat     = "State:/Network/Service/NetBird-%s-%d/DNS"
+ 	globalIPv4State                     = "State:/Network/Global/IPv4"
+ 	primaryServiceStateKeyFormat        = "State:/Network/Service/%s/DNS"
+ 	keySupplementalMatchDomains         = "SupplementalMatchDomains"
+diff --git a/client/internal/dns/host_windows.go b/client/internal/dns/host_windows.go
+index 6462d0c..8385de8 100644
+--- a/client/internal/dns/host_windows.go
++++ b/client/internal/dns/host_windows.go
+@@ -21,6 +21,8 @@ import (
+ 	nberrors "github.com/netbirdio/netbird/client/errors"
+ 	"github.com/netbirdio/netbird/client/internal/statemanager"
+ 	"github.com/netbirdio/netbird/client/internal/winregistry"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ var (
+@@ -36,17 +38,6 @@ var (
+ // Registry locations of the host DNS configuration this package programs,
+ // exported so a diagnostic reader reports the same locations that are written.
+ const (
+-	// NRPTKeyPrefix starts the name of every NRPT rule key this client creates:
+-	// the match rules, the catch-all, and the .local exemption. Cleanup
+-	// enumerates by this prefix, so a new kind of rule is removed by existing
+-	// code as long as its key starts here.
+-	NRPTKeyPrefix = "NetBird-"
+-
+-	// nrptMatchKeyName names the match-domain rules. Older versions used
+-	// different layouts under the same name: a single unsuffixed key, then one
+-	// key per domain, now one key per batch of domains.
+-	nrptMatchKeyName = NRPTKeyPrefix + "Match"
+-
+ 	// DNSPolicyConfigRoot holds the NRPT rules of the local policy store.
+ 	DNSPolicyConfigRoot = `SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig`
+ 
+@@ -60,13 +51,27 @@ const (
+ 	InterfaceConfigPathV6 = `SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces`
+ )
+ 
+-const (
++// JetBox: префикс NRPT задаётся при сборке (jetboxbrand), поэтому эти имена — var, не const.
++var (
++	// NRPTKeyPrefix starts the name of every NRPT rule key this client creates:
++	// the match rules, the catch-all, and the .local exemption. Cleanup
++	// enumerates by this prefix, so a new kind of rule is removed by existing
++	// code as long as its key starts here.
++	NRPTKeyPrefix = jetboxbrand.NRPTKeyPrefix
++
++	// nrptMatchKeyName names the match-domain rules. Older versions used
++	// different layouts under the same name: a single unsuffixed key, then one
++	// key per domain, now one key per batch of domains.
++	nrptMatchKeyName = NRPTKeyPrefix + "Match"
++
+ 	dnsPolicyConfigMatchPath    = DNSPolicyConfigRoot + `\` + nrptMatchKeyName
+ 	gpoDnsPolicyConfigMatchPath = GPODNSPolicyConfigRoot + `\` + nrptMatchKeyName
+ 
+ 	dnsPolicyConfigExemptLocalPath    = DNSPolicyConfigRoot + `\` + NRPTKeyPrefix + `ExemptLocal`
+ 	gpoDnsPolicyConfigExemptLocalPath = GPODNSPolicyConfigRoot + `\` + NRPTKeyPrefix + `ExemptLocal`
++)
+ 
++const (
+ 	nrptCatchAllNamespace = "."
+ 	// nrptLocalNamespace is reserved for multicast DNS by RFC 6762: a unicast
+ 	// resolver must not answer for it. The catch-all rule would hand it to us
+diff --git a/client/internal/dns/jetbox_scutil_darwin_test.go b/client/internal/dns/jetbox_scutil_darwin_test.go
+new file mode 100644
+index 0000000..78900ce
+--- /dev/null
++++ b/client/internal/dns/jetbox_scutil_darwin_test.go
+@@ -0,0 +1,22 @@
++//go:build !ios
++
++package dns
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
++)
++
++// Ключи DNS в scutil строятся от префикса сборки — чтобы служба JetBox не писала в ключи
++// официального NetBird и не удаляла их при уборке.
++func TestJetboxScutilKeysUseBrandPrefix(t *testing.T) {
++	p := jetboxbrand.ScutilKeyPrefix
++	if got := getKeyWithInput(netbirdDNSStateKeyFormat, matchSuffix); got != "State:/Network/Service/"+p+"Match/DNS" {
++		t.Errorf("ключ match: %q", got)
++	}
++	if got := strings.Count(netbirdDNSStateKeyIndexedFormat, p); got != 1 {
++		t.Errorf("индексированный формат без префикса: %q", netbirdDNSStateKeyIndexedFormat)
++	}
++}
+diff --git a/client/internal/portforward/manager.go b/client/internal/portforward/manager.go
+index 7d5a4cb..2ff7f33 100644
+--- a/client/internal/portforward/manager.go
++++ b/client/internal/portforward/manager.go
+@@ -12,15 +12,18 @@ import (
+ 
+ 	"github.com/netbirdio/go-nat"
+ 	log "github.com/sirupsen/logrus"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ const (
+ 	defaultMappingTTL   = 2 * time.Hour
+ 	healthCheckInterval = 1 * time.Minute
+ 	discoveryTimeout    = 10 * time.Second
+-	mappingDescription  = "NetBird"
+ )
+ 
++var mappingDescription = jetboxbrand.PortMappingDescription
++
+ // upnpErrPermanentLeaseOnly matches UPnP error 725 in SOAP fault XML,
+ // allowing for whitespace/newlines between tags from different router firmware.
+ var upnpErrPermanentLeaseOnly = regexp.MustCompile(`<errorCode>\s*725\s*</errorCode>`)
+diff --git a/client/internal/profilemanager/config.go b/client/internal/profilemanager/config.go
+index 3d378a9..4f6bf27 100644
+--- a/client/internal/profilemanager/config.go
++++ b/client/internal/profilemanager/config.go
+@@ -26,18 +26,25 @@ import (
+ 	mgm "github.com/netbirdio/netbird/shared/management/client"
+ 	"github.com/netbirdio/netbird/shared/management/domain"
+ 	"github.com/netbirdio/netbird/util"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ const (
+ 	// managementLegacyPortString is the port that was used before by the Management gRPC server.
+ 	// It is used for backward compatibility now.
+ 	managementLegacyPortString = "33073"
+-	// DefaultManagementURL points to the NetBird's cloud management endpoint
+-	DefaultManagementURL = "https://api.netbird.io:443"
+ 	// oldDefaultManagementURL points to the NetBird's old cloud management endpoint
+ 	oldDefaultManagementURL = "https://api.wiretrustee.com:443"
++)
++
++// JetBox: адреса по умолчанию задаются при сборке (jetboxbrand) — свежий профиль службы JetBox
++// не должен смотреть в облако NetBird.
++var (
++	// DefaultManagementURL points to the NetBird's cloud management endpoint
++	DefaultManagementURL = jetboxbrand.DefaultManagementURL
+ 	// DefaultAdminURL points to NetBird's cloud management console
+-	DefaultAdminURL = "https://app.netbird.io:443"
++	DefaultAdminURL = jetboxbrand.DefaultAdminURL
+ )
+ 
+ // mgmProber is the subset of management client needed for URL migration probes.
+diff --git a/client/internal/profilemanager/jetbox_legacy_test.go b/client/internal/profilemanager/jetbox_legacy_test.go
+new file mode 100644
+index 0000000..69f266a
+--- /dev/null
++++ b/client/internal/profilemanager/jetbox_legacy_test.go
+@@ -0,0 +1,18 @@
++package profilemanager
++
++import (
++	"testing"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
++)
++
++// Старый конфиг, который служба копирует при первом старте, ищется в каталоге из сборки,
++// а не в /etc/netbird официального NetBird.
++func TestJetboxLegacyConfigDirFromBrand(t *testing.T) {
++	if oldDefaultConfigPathDir != jetboxbrand.LegacyUnixConfigDir {
++		t.Skipf("на этой ОС старый каталог свой: %q", oldDefaultConfigPathDir)
++	}
++	if oldDefaultConfigPath != jetboxbrand.LegacyUnixConfigDir+"config.json" {
++		t.Errorf("oldDefaultConfigPath = %q", oldDefaultConfigPath)
++	}
++}
+diff --git a/client/internal/profilemanager/service.go b/client/internal/profilemanager/service.go
+index e58f421..ab32210 100644
+--- a/client/internal/profilemanager/service.go
++++ b/client/internal/profilemanager/service.go
+@@ -16,6 +16,8 @@ import (
+ 	log "github.com/sirupsen/logrus"
+ 
+ 	"github.com/netbirdio/netbird/util"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ var (
+@@ -64,15 +66,15 @@ func (e *ErrAmbiguousHandle) Error() string {
+ 
+ func init() {
+ 
+-	DefaultConfigPathDir = "/var/lib/netbird/"
+-	oldDefaultConfigPathDir = "/etc/netbird/"
++	DefaultConfigPathDir = jetboxbrand.UnixDataDir + "/"
++	oldDefaultConfigPathDir = jetboxbrand.LegacyUnixConfigDir
+ 
+ 	if stateDir := os.Getenv("NB_STATE_DIR"); stateDir != "" {
+ 		DefaultConfigPathDir = stateDir
+ 	} else {
+ 		switch runtime.GOOS {
+ 		case "windows":
+-			oldDefaultConfigPathDir = filepath.Join(os.Getenv("PROGRAMDATA"), "Netbird")
++			oldDefaultConfigPathDir = filepath.Join(os.Getenv("PROGRAMDATA"), jetboxbrand.WindowsDataDirName)
+ 			DefaultConfigPathDir = oldDefaultConfigPathDir
+ 
+ 		case "freebsd":
+diff --git a/client/internal/updater/installer/installer_run_darwin.go b/client/internal/updater/installer/installer_run_darwin.go
+index 5650bc7..7f42bba 100644
+--- a/client/internal/updater/installer/installer_run_darwin.go
++++ b/client/internal/updater/installer/installer_run_darwin.go
+@@ -13,6 +13,8 @@ import (
+ 	"time"
+ 
+ 	log "github.com/sirupsen/logrus"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ const (
+@@ -20,12 +22,12 @@ const (
+ 	updaterBinary = "updater"
+ 	uiBinary      = "/Applications/NetBird.app"
+ 
+-	defaultTempDir = "/var/lib/netbird/tmp-install"
+-
+ 	pkgDownloadURL = "https://github.com/netbirdio/netbird/releases/download/v%version/netbird_%version_darwin_%arch.pkg"
+ )
+ 
+ var (
++	defaultTempDir = filepath.Join(jetboxbrand.UnixDataDir, "tmp-install")
++
+ 	binaryExtensions = []string{"pkg"}
+ )
+ 
+diff --git a/client/internal/updater/installer/installer_run_windows.go b/client/internal/updater/installer/installer_run_windows.go
+index b2ecf32..503dbd4 100644
+--- a/client/internal/updater/installer/installer_run_windows.go
++++ b/client/internal/updater/installer/installer_run_windows.go
+@@ -14,6 +14,8 @@ import (
+ 
+ 	log "github.com/sirupsen/logrus"
+ 	"golang.org/x/sys/windows"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ const (
+@@ -34,7 +36,7 @@ const (
+ )
+ 
+ var (
+-	defaultTempDir = filepath.Join(os.Getenv("ProgramData"), "Netbird", "tmp-install")
++	defaultTempDir = filepath.Join(os.Getenv("ProgramData"), jetboxbrand.WindowsDataDirName, "tmp-install")
+ 
+ 	// for the cleanup
+ 	binaryExtensions = []string{"msi", "exe"}
+diff --git a/client/jetboxbrand/brand.go b/client/jetboxbrand/brand.go
+new file mode 100644
+index 0000000..9ab2635
+--- /dev/null
++++ b/client/jetboxbrand/brand.go
+@@ -0,0 +1,70 @@
++// Package jetboxbrand собирает в одном месте имена, которые служба оставляет в системе
++// и которые видны пользователю или сталкиваются с установленным рядом официальным NetBird.
++//
++// Значения по умолчанию — ровно апстримовские: без флагов сборки поведение не меняется.
++// Сборка JetBox задаёт их через
++//
++//	-ldflags "-X github.com/netbirdio/netbird/client/jetboxbrand.<Имя>=<значение>"
++//
++// (см. daemon/JETBOX-BUILD.md). Только строки — так требует -X.
++package jetboxbrand
++
++var (
++	// ServiceName — имя системной службы по умолчанию для `service …` (Windows — ключ службы,
++	// macOS — label launchd). Пусто — апстрим: «Netbird» на Windows, «netbird» на остальных.
++	ServiceName = ""
++	// ServiceDisplayName — отображаемое имя службы (Windows «Службы»).
++	ServiceDisplayName = "Netbird"
++	// ServiceDescription — описание службы.
++	ServiceDescription = "NetBird mesh network client"
++
++	// FirewallRuleName — имя правила брандмауэра Windows для интерфейса (+ «-v6»).
++	FirewallRuleName = "Netbird"
++	// NRPTKeyPrefix — префикс ключей NRPT (DNS-правила Windows); уборка удаляет всё с этим префиксом.
++	NRPTKeyPrefix = "NetBird-"
++	// ScutilKeyPrefix — префикс ключей State:/Network/Service/<префикс>… в scutil (DNS macOS);
++	// уборка удаляет всё с этим префиксом.
++	ScutilKeyPrefix = "NetBird-"
++
++	// WindowsDataDirName — каталог в %ProgramData% по умолчанию: состояние без NB_STATE_DIR,
++	// лог паники, tmp-install.
++	WindowsDataDirName = "Netbird"
++	// UnixDataDir — каталог состояния по умолчанию на macOS/Linux (без NB_STATE_DIR), tmp-install.
++	UnixDataDir = "/var/lib/netbird"
++
++	// PortMappingDescription — описание проброса порта UPnP/NAT-PMP на роутере.
++	PortMappingDescription = "NetBird"
++
++	// LegacyUnixConfigDir — старый каталог конфига на macOS/Linux. Служба при первом старте
++	// копирует оттуда config.json в свой профиль, CLI держит там конфиг по умолчанию.
++	// Для JetBox — свой (несуществующий) каталог: иначе служба подхватит ключ и management
++	// официального NetBird, стоявшего на этом компьютере.
++	LegacyUnixConfigDir = "/etc/netbird/"
++	// UnixLogDir — каталог логов CLI по умолчанию на macOS/Linux.
++	UnixLogDir = "/var/log/netbird/"
++	// UnixRunDir — где CLI ищет сокет службы, если сокета по умолчанию нет.
++	UnixRunDir = "/var/run/netbird"
++	// DaemonAddrUnix — канал службы по умолчанию для CLI на macOS/Linux.
++	DaemonAddrUnix = "unix:///var/run/netbird.sock"
++	// DaemonAddrWindows — канал службы по умолчанию для CLI на Windows; пусто — апстрим.
++	DaemonAddrWindows = ""
++
++	// MDMPlistPath — управляемые настройки macOS (MDM), применяются службой последним слоем.
++	MDMPlistPath = "/Library/Managed Preferences/io.netbird.client.plist"
++	// MDMRegistryPath — то же для Windows (HKLM).
++	MDMRegistryPath = `Software\Policies\NetBird`
++
++	// SSHClientConfigFile — файл в /etc/ssh/ssh_config.d (и аналоге Windows), который служба
++	// пишет и удаляет при остановке.
++	SSHClientConfigFile = "99-netbird.conf"
++
++	// DarwinLaunchdStdoutLog и DarwinLaunchdStderrLog — логи stdout/stderr службы под launchd,
++	// которые собирает отладочный пакет.
++	DarwinLaunchdStdoutLog = "/var/log/netbird.out.log"
++	DarwinLaunchdStderrLog = "/var/log/netbird.err.log"
++
++	// DefaultManagementURL и DefaultAdminURL — адреса, которые служба пишет в новый профиль, пока
++	// приложение не передало свой (Login{managementUrl}).
++	DefaultManagementURL = "https://api.netbird.io:443"
++	DefaultAdminURL      = "https://app.netbird.io:443"
++)
+diff --git a/client/jetboxbrand/brand_test.go b/client/jetboxbrand/brand_test.go
+new file mode 100644
+index 0000000..ca53f09
+--- /dev/null
++++ b/client/jetboxbrand/brand_test.go
+@@ -0,0 +1,96 @@
++package jetboxbrand
++
++import (
++	"os"
++	"strings"
++	"testing"
++)
++
++func current() map[string]string {
++	return map[string]string{
++		"ServiceName":            ServiceName,
++		"ServiceDisplayName":     ServiceDisplayName,
++		"ServiceDescription":     ServiceDescription,
++		"FirewallRuleName":       FirewallRuleName,
++		"NRPTKeyPrefix":          NRPTKeyPrefix,
++		"ScutilKeyPrefix":        ScutilKeyPrefix,
++		"WindowsDataDirName":     WindowsDataDirName,
++		"UnixDataDir":            UnixDataDir,
++		"PortMappingDescription": PortMappingDescription,
++		"LegacyUnixConfigDir":    LegacyUnixConfigDir,
++		"UnixLogDir":             UnixLogDir,
++		"UnixRunDir":             UnixRunDir,
++		"DaemonAddrUnix":         DaemonAddrUnix,
++		"DaemonAddrWindows":      DaemonAddrWindows,
++		"MDMPlistPath":           MDMPlistPath,
++		"MDMRegistryPath":        MDMRegistryPath,
++		"SSHClientConfigFile":    SSHClientConfigFile,
++		"DarwinLaunchdStdoutLog": DarwinLaunchdStdoutLog,
++		"DarwinLaunchdStderrLog": DarwinLaunchdStderrLog,
++		"DefaultManagementURL":   DefaultManagementURL,
++		"DefaultAdminURL":        DefaultAdminURL,
++	}
++}
++
++// Без флагов сборки — ровно апстрим (патч не меняет поведение NetBird сам по себе).
++func TestDefaultsAreUpstream(t *testing.T) {
++	if os.Getenv("JETBOX_BRAND_EXPECT") != "" {
++		t.Skip("сборка с -X: проверяет TestBuildValues")
++	}
++	want := map[string]string{
++		"ServiceName":            "",
++		"ServiceDisplayName":     "Netbird",
++		"ServiceDescription":     "NetBird mesh network client",
++		"FirewallRuleName":       "Netbird",
++		"NRPTKeyPrefix":          "NetBird-",
++		"ScutilKeyPrefix":        "NetBird-",
++		"WindowsDataDirName":     "Netbird",
++		"UnixDataDir":            "/var/lib/netbird",
++		"PortMappingDescription": "NetBird",
++		"LegacyUnixConfigDir":    "/etc/netbird/",
++		"UnixLogDir":             "/var/log/netbird/",
++		"UnixRunDir":             "/var/run/netbird",
++		"DaemonAddrUnix":         "unix:///var/run/netbird.sock",
++		"DaemonAddrWindows":      "",
++		"MDMPlistPath":           "/Library/Managed Preferences/io.netbird.client.plist",
++		"MDMRegistryPath":        `Software\Policies\NetBird`,
++		"SSHClientConfigFile":    "99-netbird.conf",
++		"DarwinLaunchdStdoutLog": "/var/log/netbird.out.log",
++		"DarwinLaunchdStderrLog": "/var/log/netbird.err.log",
++		"DefaultManagementURL":   "https://api.netbird.io:443",
++		"DefaultAdminURL":        "https://app.netbird.io:443",
++	}
++	for k, v := range want {
++		if got := current()[k]; got != v {
++			t.Errorf("%s = %q, апстрим %q", k, got, v)
++		}
++	}
++}
++
++// daemon/scripts/test.sh гоняет пакет с теми же -X, что и сборка, и передаёт ожидание
++// в JETBOX_BRAND_EXPECT («Имя=значение» через перевод строки). Опечатка в пути -X
++// линкер молча пропускает — этот тест её ловит.
++func TestBuildValues(t *testing.T) {
++	exp := os.Getenv("JETBOX_BRAND_EXPECT")
++	if exp == "" {
++		t.Skip("нет JETBOX_BRAND_EXPECT")
++	}
++	cur := current()
++	for _, line := range strings.Split(exp, "\n") {
++		if line = strings.TrimSpace(line); line == "" {
++			continue
++		}
++		k, v, ok := strings.Cut(line, "=")
++		if !ok {
++			t.Fatalf("плохая строка ожидания %q", line)
++		}
++		got, known := cur[k]
++		if !known {
++			t.Errorf("неизвестная переменная %s", k)
++			continue
++		}
++		if got != v {
++			t.Errorf("%s = %q, ждали %q (путь -X не тот?)", k, got, v)
++		}
++	}
++}
+diff --git a/client/mdm/policy_darwin.go b/client/mdm/policy_darwin.go
+index 4159f5b..0abc387 100644
+--- a/client/mdm/policy_darwin.go
++++ b/client/mdm/policy_darwin.go
+@@ -11,6 +11,8 @@ import (
+ 
+ 	log "github.com/sirupsen/logrus"
+ 	"howett.net/plist"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ // policyPlistPath is the well-known location where macOS writes the
+@@ -23,7 +25,10 @@ import (
+ // Read-only — only the OS (root) is supposed to write this file. The
+ // loader sanity-checks the file mode and refuses to honour a world-
+ // writable plist, as a defense against tampered installs.
+-const policyPlistPath = "/Library/Managed Preferences/io.netbird.client.plist"
++//
++// JetBox: путь задаётся при сборке (jetboxbrand.MDMPlistPath) — свой домен настроек,
++// чтобы MDM-политика официального NetBird не применялась к службе JetBox.
++var policyPlistPath = jetboxbrand.MDMPlistPath
+ 
+ // loadPlatform reads the MDM-managed configuration from the macOS
+ // managed-preferences plist at policyPlistPath, unless a fetcher was
+diff --git a/client/mdm/policy_windows.go b/client/mdm/policy_windows.go
+index 9363db4..04187a2 100644
+--- a/client/mdm/policy_windows.go
++++ b/client/mdm/policy_windows.go
+@@ -9,13 +9,17 @@ import (
+ 
+ 	log "github.com/sirupsen/logrus"
+ 	"golang.org/x/sys/windows/registry"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ // policyRegistryPath is the well-known MDM policy registry key for NetBird.
+ // Admins push values here through Group Policy, Intune ADMX ingestion, an
+ // Intune custom Registry CSP profile, or `reg add` during MSI deployment.
+ // Listed in the project's docs/mdm/netbird.admx schema.
+-const policyRegistryPath = `Software\Policies\NetBird`
++//
++// JetBox: путь задаётся при сборке (jetboxbrand.MDMRegistryPath).
++var policyRegistryPath = jetboxbrand.MDMRegistryPath
+ 
+ // readRegistryValue reads a single value under policyRegistryPath and,
+ // on success, stores the type-coerced result in out[canonical]. Type
+diff --git a/client/server/panic_windows.go b/client/server/panic_windows.go
+index 4bed666..ba862d6 100644
+--- a/client/server/panic_windows.go
++++ b/client/server/panic_windows.go
+@@ -12,6 +12,8 @@ import (
+ 	log "github.com/sirupsen/logrus"
+ 
+ 	"github.com/netbirdio/netbird/util"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+ const (
+@@ -28,7 +30,7 @@ var (
+ 
+ func handlePanicLog() error {
+ 	// TODO: move this to a central location
+-	logDir := path.Join(os.Getenv("PROGRAMDATA"), "Netbird")
++	logDir := path.Join(os.Getenv("PROGRAMDATA"), jetboxbrand.WindowsDataDirName)
+ 	logPath := path.Join(logDir, "netbird.err")
+ 
+ 	if err := os.MkdirAll(logDir, 0750); err != nil {
+diff --git a/client/ssh/common.go b/client/ssh/common.go
+index 4ebf884..218ef24 100644
+--- a/client/ssh/common.go
++++ b/client/ssh/common.go
+@@ -14,11 +14,15 @@ import (
+ 
+ 	"github.com/netbirdio/netbird/client/proto"
+ 	"github.com/netbirdio/netbird/util"
++
++	"github.com/netbirdio/netbird/client/jetboxbrand"
+ )
+ 
+-const (
+-	NetBirdSSHConfigFile = "99-netbird.conf"
++// NetBirdSSHConfigFile — JetBox: имя задаётся при сборке (jetboxbrand.SSHClientConfigFile),
++// чтобы служба не перезаписывала и не удаляла ssh-конфиг официального NetBird.
++var NetBirdSSHConfigFile = jetboxbrand.SSHClientConfigFile
+ 
++const (
+ 	UnixSSHConfigDir    = "/etc/ssh/ssh_config.d"
+ 	WindowsSSHConfigDir = "ssh/ssh_config.d"
+ )
