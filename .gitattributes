@@ -1,0 +1,6 @@
+# Патчи службы накладываются на исходник апстрима с LF — на Windows их нельзя переводить в CRLF.
+*.patch -text
+# Скрипты и исходники — всегда LF (sh в Git Bash не переносит CR).
+*.sh text eol=lf
+*.go text eol=lf
+*.env text eol=lf
