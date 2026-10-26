@@ -69,6 +69,7 @@ jobs:
 
       - name: Tests
         run: |
+          sh packaging/windows/lint.sh
           (cd app/frontend && pnpm install --frozen-lockfile --ignore-scripts && pnpm build)
           go vet ./core/... ./app/...
           go test -count=1 ./core/... ./app/...

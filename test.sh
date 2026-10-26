@@ -12,6 +12,9 @@ echo "== фронтенд"
 (cd "$ROOT/app/frontend" && pnpm install --frozen-lockfile --ignore-scripts >/dev/null && pnpm build >/dev/null)
 
 cd "$ROOT"
+echo "== NSIS lint"
+sh "$ROOT/packaging/windows/lint.sh"
+
 echo "== go vet (своя ОС, Windows, macOS)"
 go vet ./core/... ./app/...
 GOOS=windows go vet ./core/... ./app/...

@@ -163,7 +163,10 @@ Section "Uninstall"
 
   ; Снять компьютер с учёта, чтобы место в JetBox освободилось. Не дольше 15 с (офлайн — не ждём).
   DetailPrint "$(StepDeregister)"
-  nsExec::Exec 'powershell -NoProfile -NonInteractive -Command "$$p = Start-Process -FilePath ''$INSTDIR\jetboxd.exe'' -ArgumentList ''deregister'',''--daemon-addr'',''npipe://jetbox'' -WindowStyle Hidden -PassThru; if (-not $$p.WaitForExit(15000)) { $$p.Kill() }"'
+  ; Прямой вызов: служба ещё жива, сама ждёт management не дольше 15 с; /TIMEOUT — страховка.
+  ; (Раньше здесь была обёртка PowerShell с '' внутри строки в одинарных кавычках — NSIS резал её
+  ; на части, и снятие с учёта не запускалось вовсе; packaging/windows/lint.sh это ловит.)
+  nsExec::ExecToLog /TIMEOUT=20000 '"$INSTDIR\jetboxd.exe" deregister --daemon-addr npipe://jetbox'
   Pop $0
 
   nsExec::Exec '"$INSTDIR\jetboxd.exe" service stop'
