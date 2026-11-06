@@ -14,7 +14,7 @@ no upstream auto-update, no hardware identifiers sent to the server.
 | Directory | What |
 |---|---|
 | `core/` | shared Go code: connection link parsing, service client (gRPC), connect flow, "ping to home", other-VPN check |
-| `app/` | desktop app (Wails v3): window + tray / menu bar icon; UI in `app/frontend` (React) |
+| `app/` | desktop app (Wails v3): window + tray / menu bar icon; UI in `app/frontend` (React); fixes to Wails in [`app/wails/patches`](app/wails/patches), applied at build time by `app/wails/prepare.sh` |
 | `daemon/` | the JetBox service: upstream NetBird tag + patches ([`daemon/JETBOX-BUILD.md`](daemon/JETBOX-BUILD.md)) |
 | `packaging/windows` | NSIS installer `JetBox-Setup.exe` |
 | `packaging/macos` | `.pkg` installer (signing, notarization) |

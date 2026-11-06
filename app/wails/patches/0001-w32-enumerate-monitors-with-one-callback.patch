@@ -1,0 +1,55 @@
+Subject: [PATCH] w32: enumerate monitors with one callback per process
+
+GetAllScreens runs on every WM_DISPLAYCHANGE and called syscall.NewCallback on a
+fresh closure each time; Go allows about 2000 callbacks per process, after that
+the runtime throws "too many callback functions". JetBox crashed after a few days
+on a machine with frequent RDP sessions. One trampoline callback is created once;
+the current enumerator is passed through a mutex-guarded variable.
+---
+--- a/pkg/w32/screen.go
++++ b/pkg/w32/screen.go
+@@ -4,6 +4,7 @@
+ 
+ import (
+ 	"fmt"
++	"sync"
+ 	"syscall"
+ 	"unsafe"
+ )
+@@ -83,6 +84,20 @@
+ 	return cursor, ret != 0
+ }
+ 
++// JetBox: один колбэк EnumDisplayMonitors на процесс. Раньше syscall.NewCallback вызывался на каждый
++// GetAllScreens (а его зовут на каждый WM_DISPLAYCHANGE: RDP, сон монитора) и каждый раз занимал новый
++// слот — их около 2000 на процесс, дальше fatal «too many callback functions». Перечисление синхронное,
++// поэтому текущая функция передаётся через переменную под мьютексом.
++var (
++	enumMonitorsMu sync.Mutex
++	enumMonitorsCB uintptr
++	enumMonitorsFn func(hMonitor uintptr, hdc uintptr, lprcMonitor *RECT, lParam uintptr) uintptr
++)
++
++func enumMonitorsTrampoline(hMonitor uintptr, hdc uintptr, lprcMonitor *RECT, lParam uintptr) uintptr {
++	return enumMonitorsFn(hMonitor, hdc, lprcMonitor, lParam)
++}
++
+ func GetAllScreens() ([]*Screen, error) {
+ 	var result []*Screen
+ 	var errMessage string
+@@ -142,7 +157,14 @@
+ 		return 1 // Continue enumeration
+ 	}
+ 
+-	ret, _, _ := procEnumDisplayMonitors.Call(0, 0, syscall.NewCallback(enumFunc), 0)
++	enumMonitorsMu.Lock()
++	if enumMonitorsCB == 0 {
++		enumMonitorsCB = syscall.NewCallback(enumMonitorsTrampoline)
++	}
++	enumMonitorsFn = enumFunc
++	ret, _, _ := procEnumDisplayMonitors.Call(0, 0, enumMonitorsCB, 0)
++	enumMonitorsFn = nil
++	enumMonitorsMu.Unlock()
+ 	if ret == 0 {
+ 		return nil, fmt.Errorf("EnumDisplayMonitors failed: %s", errMessage)
+ 	}

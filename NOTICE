@@ -8,7 +8,8 @@ The JetBox service is built from NetBird v0.81.4 client sources with patches
 in daemon/patches. JetBox is not affiliated with or endorsed by NetBird GmbH.
 
 This product includes Wails (https://wails.io), MIT License,
-Copyright (c) 2018-present Lea Anthony.
+Copyright (c) 2018-present Lea Anthony, built from the NetBird fork
+(github.com/netbirdio/wails) with patches in app/wails/patches.
 
 The app UI uses React (https://react.dev), MIT License,
 Copyright (c) Meta Platforms, Inc. and affiliates.

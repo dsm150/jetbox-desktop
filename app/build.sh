@@ -43,6 +43,10 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Wails — форк из go.mod с нашими исправлениями (app/wails/patches): go.work с replace на копию.
+# Только для сборки приложения: служба собирается в своём модуле.
+WAILS_WORK=$(sh "$APP/wails/prepare.sh")
+
 (cd "$APP/frontend" && pnpm install --frozen-lockfile --ignore-scripts >/dev/null && pnpm build >/dev/null)
 
 build_windows() {
@@ -56,7 +60,7 @@ build_windows() {
     -product-ver-major "$VMAJ" -product-ver-minor "$VMIN" -product-ver-patch "$VPAT" -product-ver-build "$BUILD" \
     -file-version "$VERSION.$BUILD" -product-version "$VERSION.$BUILD" \
     versioninfo.json)
-  (cd "$ROOT" && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags production -trimpath \
+  (cd "$ROOT" && GOWORK="$WAILS_WORK" GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags production -trimpath \
     -ldflags "$LDFLAGS -H windowsgui" -o "$OUT/windows-amd64/JetBox.exe" ./app)
   cleanup # .syso не должен попасть в сборку macOS (target all)
   TMP=""
@@ -70,7 +74,7 @@ build_darwin() {
   for ARCH in amd64 arm64; do
     (cd "$ROOT" && GOOS=darwin GOARCH=$ARCH CGO_ENABLED=1 MACOSX_DEPLOYMENT_TARGET=$MACOS_MIN \
       CGO_CFLAGS="-mmacosx-version-min=$MACOS_MIN" CGO_LDFLAGS="-mmacosx-version-min=$MACOS_MIN" \
-      go build -tags production -trimpath -ldflags "$LDFLAGS" -o "$OUT/darwin-$ARCH/JetBox" ./app)
+      GOWORK="$WAILS_WORK" go build -tags production -trimpath -ldflags "$LDFLAGS" -o "$OUT/darwin-$ARCH/JetBox" ./app)
   done
   lipo -create -output "$BUNDLE/Contents/MacOS/JetBox" "$OUT/darwin-amd64/JetBox" "$OUT/darwin-arm64/JetBox"
   sed -e "s/__VERSION__/$VERSION/" -e "s/__BUILD__/$BUILD/" -e "s/__MINOS__/$MACOS_MIN/" \
