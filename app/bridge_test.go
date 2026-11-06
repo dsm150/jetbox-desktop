@@ -22,6 +22,9 @@ type testEngine struct {
 	calls   map[string]int
 	block   chan struct{}
 	entered chan string
+
+	autoConnect *bool // последняя галочка; nil — не меняли (в коробке включено)
+	syncErr     error // ответ SyncAutoConnect
 }
 
 func (e *testEngine) enter(name string) {
@@ -60,8 +63,24 @@ func (e *testEngine) Reconcile(context.Context) error  { e.enter("Reconcile"); r
 func (e *testEngine) Disconnect(context.Context) error { e.enter("Disconnect"); return nil }
 func (e *testEngine) Reconnect(context.Context) error  { e.enter("Reconnect"); return nil }
 func (e *testEngine) Forget(context.Context) error     { e.enter("Forget"); return nil }
+func (e *testEngine) SetAutoConnect(_ context.Context, on bool) error {
+	e.enter("SetAutoConnect")
+	e.mu.Lock()
+	e.autoConnect = &on
+	e.mu.Unlock()
+	return nil
+}
+func (e *testEngine) SyncAutoConnect(context.Context) error {
+	e.enter("SyncAutoConnect")
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.syncErr
+}
 func (e *testEngine) Box() (flow.Box, bool, error) {
-	return flow.Box{Identity: "id", Name: "Demo"}, true, nil
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ac := e.autoConnect == nil || *e.autoConnect
+	return flow.Box{Identity: "id", Name: "Demo", AutoConnect: ac}, true, nil
 }
 
 type testStatus struct {
@@ -227,5 +246,19 @@ func TestColdStartHomeShowsWindowUnlessAutostart(t *testing.T) {
 	b.start("", false)
 	if !b.wantShow {
 		t.Fatal("ручной запуск на главном экране должен показать окно")
+	}
+}
+
+// В журнал идёт текст отказа, а не только вид: errorKind="Unknown" без причины не разобрать
+// (02.11.2026 — служба отклоняла SetConfig, в app.log было только Unknown).
+func TestScreenLogLineCarriesErrorDetail(t *testing.T) {
+	got := screenLogLine(controller.State{Screen: controller.ScreenError, ErrorKind: "Unknown",
+		ErrorDetail: "Unknown: настройка службы: update settings are disabled"})
+	want := `screen error errorKind="Unknown" detail="Unknown: настройка службы: update settings are disabled"`
+	if got != want {
+		t.Fatalf("got %s, want %s", got, want)
+	}
+	if got := screenLogLine(controller.State{Screen: controller.ScreenReady}); got != `screen ready errorKind=""` {
+		t.Fatalf("без отказа: %s", got)
 	}
 }

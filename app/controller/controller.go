@@ -27,6 +27,8 @@ type Engine interface {
 	Disconnect(ctx context.Context) error
 	Reconnect(ctx context.Context) error
 	Forget(ctx context.Context) error
+	SetAutoConnect(ctx context.Context, on bool) error
+	SyncAutoConnect(ctx context.Context) error
 	Box() (flow.Box, bool, error)
 }
 
@@ -181,9 +183,9 @@ func clearError(s *State) {
 
 func setBox(s *State, b flow.Box, has bool) {
 	if has {
-		s.BoxName, s.ExitName, s.NoExit = b.Name, b.ExitNode, b.NoExit
+		s.BoxName, s.ExitName, s.NoExit, s.AutoConnect = b.Name, b.ExitNode, b.NoExit, b.AutoConnect
 	} else {
-		s.BoxName, s.ExitName, s.NoExit = "", "", false
+		s.BoxName, s.ExitName, s.NoExit, s.AutoConnect = "", "", false, false
 	}
 }
 
@@ -627,6 +629,39 @@ func (c *Controller) Forget(ctx context.Context) {
 		c.fail(err, OpForget, nil)
 	}
 	c.drainLink(ctx)
+}
+
+// SetAutoConnect — галочка «Подключаться автоматически». Busy не занимает: core/flow
+// сам упорядочит вызов со службой; во время действия и без коробки — ничего. Отказ
+// (не записать коробку) экрана ошибки не показывает: галочка вернётся к записанному.
+func (c *Controller) SetAutoConnect(ctx context.Context, on bool) {
+	if _, has, _ := c.eng.Box(); !has || c.State().Busy {
+		return
+	}
+	_ = c.eng.SetAutoConnect(ctx, on)
+	box, has, _ := c.eng.Box()
+	c.mutate(func(s *State) bool {
+		want := has && box.AutoConnect
+		if s.AutoConnect == want {
+			return false
+		}
+		s.AutoConnect = want
+		return true
+	})
+}
+
+// SyncAutoConnect — флаг службы по её текущему состоянию (переход с ≤1.0.3, один раз).
+func (c *Controller) SyncAutoConnect(ctx context.Context) error { return c.eng.SyncAutoConnect(ctx) }
+
+// SetAutostart — состояние «Запускать JetBox при входе» (его знает приложение, не служба).
+func (c *Controller) SetAutostart(a Autostart) {
+	c.mutate(func(s *State) bool {
+		if s.Autostart == a {
+			return false
+		}
+		s.Autostart = a
+		return true
+	})
 }
 
 // Uninstall — «Удалить JetBox…»: run — штатное удаление ОС; пока оно идёт, Busy (окно

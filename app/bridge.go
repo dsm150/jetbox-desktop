@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"runtime"
 	"sync"
@@ -44,6 +45,8 @@ type bridge struct {
 	ctl  *controller.Controller
 	tray *tray
 	lang string
+	auto autostarter // nil — автозапуск не трогаем (тесты)
+	dir  string      // каталог настроек: метка автозапуска по умолчанию
 
 	// Команды идут в контроллер напрямую, каждая в своей горутине: контроллер сам
 	// не пускает второе действие, пока идёт первое (Busy), и сам откладывает ссылку.
@@ -108,13 +111,23 @@ func (b *bridge) publish(s controller.State) {
 	b.logMu.Lock()
 	if s.Screen != b.lastScreen || s.ErrorKind != b.lastErr {
 		b.lastScreen, b.lastErr = s.Screen, s.ErrorKind
-		log.Printf("screen %s errorKind=%q", s.Screen, s.ErrorKind)
+		log.Print(screenLogLine(s))
 	}
 	b.logMu.Unlock()
 	b.app.Event.Emit(eventState, s)
 	if b.tray != nil {
 		b.tray.update(s)
 	}
+}
+
+// screenLogLine — строка журнала о смене экрана. При отказе — с текстом причины: ErrorDetail
+// контроллер уже очистил от ключа ссылки (scrub), а одного errorKind="Unknown" для разбора мало.
+func screenLogLine(s controller.State) string {
+	line := fmt.Sprintf("screen %s errorKind=%q", s.Screen, s.ErrorKind)
+	if s.ErrorDetail != "" {
+		line += fmt.Sprintf(" detail=%q", s.ErrorDetail)
+	}
+	return line
 }
 
 // showWindow — единственный путь показа окна (холодный старт, ссылка, трей, второй запуск).
@@ -160,9 +173,13 @@ func (b *bridge) doShow() {
 // при входе в систему (тогда только значок). Ручной запуск показывает окно и на
 // главном экране: на Windows 11 значок трея прячется в скрытые.
 func (b *bridge) start(argLink string, autostart bool) {
+	// Автозапуск — до Init: служба может молчать до cmdTimeout, а реестр её не ждёт.
+	applyAutostartDefault(b.auto, b.dir)
+	b.syncAutostart()
 	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
 	b.ctl.Init(ctx)
 	cancel()
+	b.syncAutoConnectSoon()
 	log.Printf("init done: screen=%s autostart=%v", b.ctl.State().Screen, autostart)
 
 	b.startMu.Lock()
@@ -229,7 +246,7 @@ func (b *bridge) onCmd(e *application.CustomEvent) {
 	switch c.Cmd {
 	case "":
 		return
-	case "chooseExit", "toggle": // ID выхода и намерение щита не секрет
+	case "chooseExit", "toggle", "setAutostart", "setAutoConnect": // ID выхода и вкл/выкл не секрет
 		log.Printf("cmd %s arg=%q", c.Cmd, c.Arg)
 	default:
 		log.Printf("cmd %s", c.Cmd)
@@ -285,6 +302,17 @@ func toggleWanted(intent string, s controller.State) bool {
 	return true
 }
 
+// onOff — аргумент галочки: "on" или "off"; иное — не команда.
+func onOff(arg string) (on, ok bool) {
+	switch arg {
+	case "on":
+		return true, true
+	case "off":
+		return false, true
+	}
+	return false, false
+}
+
 func (b *bridge) dispatch(ctx context.Context, cmd, arg string) {
 	c := b.ctl
 	switch cmd {
@@ -312,6 +340,14 @@ func (b *bridge) dispatch(ctx context.Context, cmd, arg string) {
 		}
 	case "forget":
 		c.Forget(ctx)
+	case "setAutostart":
+		if on, ok := onOff(arg); ok {
+			b.setAutostart(on)
+		}
+	case "setAutoConnect":
+		if on, ok := onOff(arg); ok {
+			c.SetAutoConnect(ctx, on)
+		}
 	case "dismiss":
 		c.Dismiss()
 	}

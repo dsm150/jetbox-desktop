@@ -19,6 +19,9 @@ type Box struct {
 	// NoExit — человек выбрал «без выхода — только сети»; тогда ExitNode пуст.
 	NoExit       bool      `json:"no_exit,omitempty"`
 	RegisteredAt time.Time `json:"registered_at"`
+	// AutoConnect — «Подключаться автоматически»: служба включает защиту при старте,
+	// если человек её не выключал. Нет в файле (≤1.0.3) — включено.
+	AutoConnect bool `json:"auto_connect"`
 }
 
 // Store хранит Box в JSON-файле в каталоге настроек приложения.
@@ -44,7 +47,7 @@ func (s *Store) Load() (Box, bool, error) {
 	if err != nil {
 		return Box{}, false, err
 	}
-	var b Box
+	b := Box{AutoConnect: true} // поля нет в файле — значение по умолчанию
 	if err := json.Unmarshal(raw, &b); err != nil {
 		// Испорченный или пустой файл (сбой питания при старой записи и т. п.) —
 		// считаем, что коробки нет: человек откроет ссылку ещё раз.

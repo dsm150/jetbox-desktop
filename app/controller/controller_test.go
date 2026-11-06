@@ -35,6 +35,7 @@ type fakeEngine struct {
 	exits     []exitpick.Candidate // ответ Exits
 	exitsErr  error
 	forgetErr error
+	acErr     error // SetAutoConnect
 	opts      []flow.Options
 	links     []jetboxlink.Payload
 	calls     []string
@@ -132,6 +133,17 @@ func (f *fakeEngine) Forget(context.Context) error {
 	f.hasBox, f.box = false, flow.Box{} // core/flow забывает коробку всегда
 	return f.forgetErr
 }
+func (f *fakeEngine) SetAutoConnect(_ context.Context, on bool) error {
+	f.enter("SetAutoConnect")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.acErr != nil {
+		return f.acErr
+	}
+	f.box.AutoConnect = on
+	return nil
+}
+func (f *fakeEngine) SyncAutoConnect(context.Context) error { f.enter("SyncAutoConnect"); return nil }
 func (f *fakeEngine) Box() (flow.Box, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

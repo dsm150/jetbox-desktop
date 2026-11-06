@@ -236,3 +236,31 @@ func TestDeselectExitsSendsOnlyIDs(t *testing.T) {
 		t.Fatalf("DeselectNetworks = %+v", got)
 	}
 }
+
+// Флаг автоподключения меняется отдельным SetConfig: только DisableAutoConnect и профиль,
+// без адреса management, интерфейса и порта — их служба оставит как есть.
+func TestSetDisableAutoConnectSendsOnlyTheFlag(t *testing.T) {
+	c, fs := newTestClient(t)
+	for _, want := range []bool{true, false} {
+		if err := c.SetDisableAutoConnect(context.Background(), want); err != nil {
+			t.Fatal(err)
+		}
+		r := fs.setConfig
+		if r == nil || r.DisableAutoConnect == nil || *r.DisableAutoConnect != want ||
+			r.GetProfileName() != "default" || r.GetUsername() != "ivan" {
+			t.Fatalf("SetConfig = %+v", r)
+		}
+		if r.GetManagementUrl() != "" || r.InterfaceName != nil || r.WireguardPort != nil || r.RosenpassEnabled != nil ||
+			r.ServerSSHAllowed != nil || r.NetworkMonitor != nil || r.DisableDns != nil {
+			t.Fatalf("SetConfig трогает лишнее: %+v", r)
+		}
+	}
+}
+
+func TestSetDisableAutoConnectProfileError(t *testing.T) {
+	c, fs := newTestClient(t)
+	fs.profileErr = errors.New("no profile")
+	if err := c.SetDisableAutoConnect(context.Background(), true); err == nil || fs.setConfig != nil {
+		t.Fatalf("err=%v setConfig=%+v", err, fs.setConfig)
+	}
+}

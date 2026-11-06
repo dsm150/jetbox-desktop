@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: JetBox build <build@jetbox.invalid>
+Date: Fri, 6 Nov 2026 13:59:40 +0300
+Subject: [PATCH] jetbox: keep reconnecting after Up when auto-connect at start
+ is off
+
+DisableAutoConnect only skips connecting when the service starts. Upstream also ran
+the connection single-shot in that case, so a connection started with Up was never
+retried after a failure. JetBox keeps the flag set while protection is off, so that
+the user's choice survives a reboot; the connection the user does start must keep
+retrying.
+---
+ client/server/server.go | 14 +++++---------
+ 1 file changed, 5 insertions(+), 9 deletions(-)
+
+diff --git a/client/server/server.go b/client/server/server.go
+index eb8bd50..6b522fb 100644
+--- a/client/server/server.go
++++ b/client/server/server.go
+@@ -378,7 +378,7 @@ func (s *Server) Start() error {
+ 
+ // connectWithRetryRuns runs the client connection with a backoff strategy where we retry the operation as additional
+ // mechanism to keep the client connected even when the connection is lost.
+-// we cancel retry if the client receive a stop or down command, or if disable auto connect is configured.
++// we cancel retry if the client receive a stop or down command.
+ //
+ // The goroutine's exit is signalled to the daemon via close(giveUpChan)
+ // — placed in the function-scope defer so every return path (panic,
+@@ -399,14 +399,10 @@ func (s *Server) connectWithRetryRuns(ctx context.Context, profileConfig *profil
+ 		}
+ 	}()
+ 
+-	if s.config.DisableAutoConnect {
+-		if err := s.connect(ctx, s.config, s.statusRecorder, runningChan); err != nil {
+-			log.Debugf("run client connection exited with error: %v", err)
+-		}
+-		log.Tracef("client connection exited")
+-		return
+-	}
+-
++	// JetBox: DisableAutoConnect only means "do not connect when the service starts" (Start).
++	// Upstream also dropped the reconnect loop here, so a connection the user started with Up
++	// was never retried after a failure. JetBox keeps the flag set while protection is off so
++	// the choice survives a reboot; the connection the user does start must stay resilient.
+ 	backOff := getConnectWithBackoff(ctx)
+ 	go func() {
+ 		t := time.NewTicker(24 * time.Hour)

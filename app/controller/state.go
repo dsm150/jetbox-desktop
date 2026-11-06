@@ -57,6 +57,12 @@ type ExitCandidate struct {
 	Active bool   `json:"active"` // ядро включило его сейчас
 }
 
+// Autostart — «Запускать JetBox при входе»: Supported — ОС умеет (сейчас Windows), иначе строка скрыта.
+type Autostart struct {
+	Supported bool `json:"supported"`
+	Enabled   bool `json:"enabled"`
+}
+
 // State — всё, что рисует окно и трей. Ключа здесь нет — только маска.
 type State struct {
 	// Seq растёт с каждым изменением; окно отбрасывает состояние со Seq меньше уже показанного.
@@ -70,7 +76,9 @@ type State struct {
 	Host        string          `json:"host"`
 	KeyMask     string          `json:"keyMask"`
 	ExitName    string          `json:"exitName"`
-	NoExit      bool            `json:"noExit"` // в коробке запомнено «без выхода — только сети»
+	NoExit      bool            `json:"noExit"`      // в коробке запомнено «без выхода — только сети»
+	AutoConnect bool            `json:"autoConnect"` // «Подключаться автоматически» (из коробки; нет коробки — false)
+	Autostart   Autostart       `json:"autostart"`
 	Candidates  []ExitCandidate `json:"candidates"`
 	ErrorKind   string          `json:"errorKind"`
 	ErrorOp     string          `json:"errorOp"` // Op* — на каком действии отказ

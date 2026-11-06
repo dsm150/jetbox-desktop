@@ -66,6 +66,22 @@ func (c *Client) Configure(ctx context.Context, managementURL, iface string, por
 	return err
 }
 
+// SetDisableAutoConnect пишет в активный профиль только флаг «не подключаться при старте
+// службы» (с патчем 0006 он больше ничего не значит). Пустой ManagementUrl и не заданные
+// поля SetConfig оставляет как есть (server.go setConfigInputFromRequest, UpdateConfig).
+func (c *Client) SetDisableAutoConnect(ctx context.Context, disable bool) error {
+	prof, err := c.c.GetActiveProfile(ctx, &proto.GetActiveProfileRequest{})
+	if err != nil {
+		return err
+	}
+	_, err = c.c.SetConfig(ctx, &proto.SetConfigRequest{
+		ProfileName:        prof.GetProfileName(),
+		Username:           prof.GetUsername(),
+		DisableAutoConnect: &disable,
+	})
+	return err
+}
+
 // Login регистрирует устройство ключом. needsBrowser — сервер просит вход через браузер
 // (для ссылки с ключом такого быть не должно). Имя устройства передаётся всегда, в том числе
 // при повторном входе без ключа: служба не отправляет системное имя компьютера.

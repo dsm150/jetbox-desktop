@@ -3,7 +3,8 @@ import type { State } from "./types";
 
 export type Cmd =
   | "hello" | "connect" | "confirmSwitch" | "cancelSwitch" | "ignoreOtherVpn" | "recheck"
-  | "chooseExit" | "noExit" | "changeExit" | "skipExit" | "toggle" | "forget" | "uninstall" | "dismiss" | "openPrivacy" | "openSite";
+  | "chooseExit" | "noExit" | "changeExit" | "skipExit" | "toggle" | "forget" | "uninstall" | "dismiss" | "openPrivacy" | "openSite"
+  | "setAutostart" | "setAutoConnect";
 
 export function send(cmd: Cmd, arg = ""): void {
   void Events.Emit("jetbox:cmd", { cmd, arg });

@@ -44,6 +44,10 @@ export interface State {
   exitName: string;
   /** В коробке запомнено «без выхода — только сети». */
   noExit: boolean;
+  /** «Подключаться автоматически» — из коробки; без коробки false (строка скрыта). */
+  autoConnect: boolean;
+  /** «Запускать JetBox при входе»: supported=false — ОС не наша забота (macOS), строка скрыта. */
+  autostart: { supported: boolean; enabled: boolean };
   candidates: ExitCandidate[] | null;
   errorKind: string;
   /** На каком действии отказ: connect | reconnect | disconnect | choose-exit | forget. */

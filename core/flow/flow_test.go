@@ -3,6 +3,7 @@ package flow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -43,6 +44,9 @@ type fakeDaemon struct {
 	loginKeys     []string                        // ключи, с которыми звали Login
 	upHook        func(ctx context.Context) error // если задан — вместо upErr
 	downCtx       []error                         // ctx.Err() на момент каждого Down
+	ac            []bool                          // значения SetDisableAutoConnect по порядку
+	acErr         error                           // ответ SetDisableAutoConnect
+	traceAC       bool                            // писать SetDisableAutoConnect и в calls
 }
 
 func (f *fakeDaemon) Status(context.Context) (*proto.StatusResponse, error) {
@@ -84,6 +88,13 @@ func (f *fakeDaemon) Down(ctx context.Context) error {
 func (f *fakeDaemon) Logout(context.Context) error {
 	f.calls = append(f.calls, "Logout")
 	return f.logoutErr
+}
+func (f *fakeDaemon) SetDisableAutoConnect(_ context.Context, disable bool) error {
+	f.ac = append(f.ac, disable)
+	if f.traceAC {
+		f.calls = append(f.calls, fmt.Sprintf("DisableAutoConnect %v", disable))
+	}
+	return f.acErr
 }
 func (f *fakeDaemon) Networks(context.Context) ([]exitpick.Network, error) {
 	f.netsCalls++

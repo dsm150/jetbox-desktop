@@ -3,10 +3,10 @@ import { send } from "../bridge";
 import { t } from "../i18n";
 import type { State } from "../types";
 import { exitText } from "./exitText";
-import { Page, Row, Section } from "./Page";
+import { Page, Row, Section, SwitchRow } from "./Page";
 
-// «Настройки» — как JetBoxSettingsScreen мобильных: JetBox (имя, выход), Приложение (версия,
-// «О программе»). Сверх мобильных — «Отвязать компьютер» и «Удалить JetBox…» (штатное удаление ОС):
+// «Настройки» — как JetBoxSettingsScreen мобильных: JetBox (имя, выход), Приложение (автозапуск,
+// автоподключение, версия, «О программе»). Сверх мобильных — «Отвязать компьютер» и «Удалить JetBox…» (штатное удаление ОС):
 // на телефоне это удаление приложения.
 export function Settings({ s, onClose, onAbout }: { s: State; onClose: () => void; onAbout: () => void }) {
   // Что подтверждаем: отвязку компьютера или удаление приложения.
@@ -18,6 +18,9 @@ export function Settings({ s, onClose, onAbout }: { s: State; onClose: () => voi
     if (!s.busy) setUninstalling(false);
   }, [s.busy]);
   const p = s.panel;
+  // Автозапуск выключен, автоподключение включено — служба поднимет защиту при входе, а значка
+  // JetBox не будет: предупреждаем. На macOS автозапуск ведёт .pkg — там не о чем.
+  const hidden = s.autostart.supported && !s.autostart.enabled && !!s.boxName && s.autoConnect;
   return (
     <Page title={t(s.lang, "settings.title")} close={{ label: t(s.lang, "common.close"), onClick: onClose }}>
       <Section header={t(s.lang, "settings.sectionBox")}>
@@ -70,7 +73,28 @@ export function Settings({ s, onClose, onAbout }: { s: State; onClose: () => voi
           </>
         )}
       </Section>
-      <Section header={t(s.lang, "settings.sectionApp")}>
+      <Section header={t(s.lang, "settings.sectionApp")} footer={hidden ? t(s.lang, "settings.autoConnectHidden") : undefined}>
+        {s.autostart.supported && (
+          <>
+            <SwitchRow
+              label={t(s.lang, "settings.autostart")}
+              on={s.autostart.enabled}
+              onChange={(on) => send("setAutostart", on ? "on" : "off")}
+            />
+            <hr />
+          </>
+        )}
+        {s.boxName && (
+          <>
+            <SwitchRow
+              label={t(s.lang, "settings.autoConnect")}
+              on={s.autoConnect}
+              disabled={s.busy}
+              onChange={(on) => send("setAutoConnect", on ? "on" : "off")}
+            />
+            <hr />
+          </>
+        )}
         <Row label={t(s.lang, "settings.version")} value={s.version} />
         <hr />
         <Row label={t(s.lang, "about.title")} onClick={onAbout} />

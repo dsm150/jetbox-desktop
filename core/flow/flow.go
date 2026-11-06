@@ -31,6 +31,7 @@ type Daemon interface {
 	Networks(ctx context.Context) ([]exitpick.Network, error)
 	SelectExit(ctx context.Context, id string) error
 	DeselectExits(ctx context.Context, ids []string) error
+	SetDisableAutoConnect(ctx context.Context, disable bool) error
 }
 
 // Stage — шаг, который показывает экран.
@@ -54,6 +55,8 @@ type Config struct {
 	// Online — «есть ли интернет вообще» (core/netcheck.Online); nil — не проверять.
 	// Уточняет ServerUnreachable до NoInternet.
 	Online func(ctx context.Context) bool
+	// Logf — журнал сбоев, которые действию не мешают (флаг автоподключения); nil — молча.
+	Logf func(format string, args ...any)
 }
 
 // Options — решения человека для этого нажатия.
@@ -71,7 +74,7 @@ type Result struct {
 }
 
 // Flow — сценарий для одной службы и одного хранилища коробки.
-// Connect, ChooseExit, ChooseNoExit, Exits, Reconcile, Disconnect, Reconnect и Forget выполняются строго по
+// Connect, ChooseExit, ChooseNoExit, Exits, Reconcile, Disconnect, Reconnect, SetAutoConnect, SyncAutoConnect и Forget выполняются строго по
 // одному (mu): Disconnect во время Connect ждёт его конца — чтобы прервать
 // подключение, отмените ctx у Connect (после Up служба будет опущена). Box
 // не ждёт mu: хранилище защищено своей блокировкой.
@@ -129,9 +132,16 @@ func (f *Flow) netError(ctx context.Context, detail string, err error) *Error {
 
 // upError разбирает отказ Up: если служба после него просит вход — регистрацию
 // отвергли (onNeedsLogin), иначе классифицируем как отказ Login.
+// Up не дождался подключения (тайм-аут службы), а служба подключается дальше —
+// защита включена: флаг автоподключения по галочке, как после удачного Up.
 func (f *Flow) upError(ctx context.Context, err error, onNeedsLogin Kind) *Error {
-	if st, serr := f.d.Status(ctx); serr == nil && needsLogin(st.GetStatus()) {
-		return &Error{Kind: onNeedsLogin, Detail: "подключение", Err: err}
+	if st, serr := f.d.Status(ctx); serr == nil {
+		switch s := st.GetStatus(); {
+		case needsLogin(s):
+			return &Error{Kind: onNeedsLogin, Detail: "подключение", Err: err}
+		case s == "Connected" || s == "Connecting":
+			f.syncAutoConnect(ctx, true)
+		}
 	}
 	return &Error{Kind: f.refine(ctx, classifyLogin(err)), Detail: "подключение", Err: err}
 }
@@ -194,6 +204,7 @@ func (f *Flow) hasExit(ctx context.Context, id string) bool {
 // его перекроет.
 func (f *Flow) leave(ctx context.Context, strict bool) error {
 	_ = f.d.Down(ctx)
+	f.syncAutoConnect(ctx, false) // Logout не пройдёт — после перезагрузки к старой не подключится
 	if err := f.d.Logout(ctx); err != nil && strict {
 		return f.netError(ctx, "не снять старую коробку", err)
 	}
@@ -303,6 +314,8 @@ func (f *Flow) Connect(ctx context.Context, link jetboxlink.Payload, opts Option
 		ManagementURL: link.ManagementURL,
 		ExitNode:      link.ExitNode,
 		RegisteredAt:  time.Now().UTC(),
+		// Галочка — выбор человека для компьютера: переживает и смену коробки.
+		AutoConnect: !has || stored.AutoConnect,
 	}
 	saved := exitpick.Saved{}
 	if same {
@@ -328,6 +341,7 @@ func (f *Flow) Connect(ctx context.Context, link jetboxlink.Payload, opts Option
 		}
 		return Result{}, f.upError(ctx, err, KindLinkExpired)
 	}
+	f.syncAutoConnect(ctx, true)
 
 	progress(StageChoosingExit)
 	res, err := f.pickExit(ctx, link.ExitNode, saved)
@@ -372,8 +386,72 @@ func cancelError(ctx context.Context, detail string, err error) *Error {
 func (f *Flow) abortUp(ctx context.Context, err error) *Error {
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	_ = f.d.Down(dctx)
+	if f.d.Down(dctx) == nil {
+		f.syncAutoConnect(dctx, false)
+	}
 	return cancelError(ctx, "подключение прервано", err)
+}
+
+// syncAutoConnect держит флаг службы «не подключаться при старте» равным
+// НЕ(AutoConnect коробки И защита включена человеком): on — защиту только что
+// включили (Up), иначе её выключили. Нет коробки — флаг ставится. Ошибка действию
+// не мешает: только в журнал (служба при старте поступит по прежнему флагу).
+func (f *Flow) syncAutoConnect(ctx context.Context, on bool) {
+	if err := f.setAutoConnectFlag(ctx, on); err != nil && f.cfg.Logf != nil {
+		f.cfg.Logf("автоподключение службы (защита включена=%v): %v", on, err)
+	}
+}
+
+func (f *Flow) setAutoConnectFlag(ctx context.Context, on bool) error {
+	disable := true
+	if on {
+		b, ok, err := f.store.Load()
+		disable = err != nil || !ok || !b.AutoConnect
+	}
+	return f.d.SetDisableAutoConnect(ctx, disable)
+}
+
+// SyncAutoConnect выставляет флаг службы по тому, что есть сейчас: служба
+// Connected/Connecting — по галочке, иначе «не подключаться». Только для перехода с
+// ≤1.0.3, где флаг не ставился: при загрузке служба может быть ещё Idle, поэтому
+// каждый запуск так делать нельзя. Ошибку возвращает — вызывающий повторит позже.
+func (f *Flow) SyncAutoConnect(ctx context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.setAutoConnectFlag(ctx, f.protectionOn(ctx))
+}
+
+// protectionOn — служба включена (Connected или Connecting).
+func (f *Flow) protectionOn(ctx context.Context) bool {
+	st, err := f.d.Status(ctx)
+	if err != nil {
+		return false
+	}
+	s := st.GetStatus()
+	return s == "Connected" || s == "Connecting"
+}
+
+// SetAutoConnect — галочка «Подключаться автоматически». Выбор хранится в коробке;
+// флаг службы меняется сразу, только если защита сейчас включена, — выключенная
+// щитом остаётся выключенной и после перезагрузки. Ошибка службы не мешает.
+func (f *Flow) SetAutoConnect(ctx context.Context, on bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, ok, err := f.store.Load()
+	if err != nil {
+		return &Error{Kind: KindUnknown, Detail: "не прочитать сохранённую коробку", Err: err}
+	}
+	if !ok {
+		return &Error{Kind: KindUnknown, Detail: "коробки нет"}
+	}
+	if b.AutoConnect != on {
+		b.AutoConnect = on
+		if err := f.store.Save(b); err != nil {
+			return &Error{Kind: KindUnknown, Detail: "не сохранить коробку", Err: err}
+		}
+	}
+	f.syncAutoConnect(ctx, f.protectionOn(ctx))
+	return nil
 }
 
 // rememberExit записывает выбранный выход в запомненную коробку (если она есть)
@@ -505,13 +583,15 @@ func (f *Flow) Exits(ctx context.Context) ([]exitpick.Candidate, error) {
 	return exitpick.Exits(nets), nil
 }
 
-// Disconnect опускает туннель, регистрация и коробка остаются.
+// Disconnect опускает туннель, регистрация и коробка остаются. Выключение
+// запоминается: служба не включит защиту сама и после перезагрузки.
 func (f *Flow) Disconnect(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.d.Down(ctx); err != nil {
 		return &Error{Kind: f.refine(ctx, classifyLogin(err)), Detail: "отключение", Err: err}
 	}
+	f.syncAutoConnect(ctx, false)
 	return nil
 }
 
@@ -556,6 +636,7 @@ func (f *Flow) Reconnect(ctx context.Context) error {
 		}
 		return f.upError(ctx, err, KindNeedsLink)
 	}
+	f.syncAutoConnect(ctx, true)
 	// Защита включена; если карта уже пришла — вернуть запомненный выбор. Не
 	// пришла — сверит опрос панели (Reconcile). Ошибка сверки включению не мешает.
 	_ = f.reconcile(ctx)
@@ -619,6 +700,9 @@ func (f *Flow) Forget(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	_ = f.d.Down(ctx)
+	// До Logout: не пройдёт он (нет сети) — служба после перезагрузки не подключится
+	// к забытой коробке.
+	f.syncAutoConnect(ctx, false)
 	logoutErr := f.d.Logout(ctx)
 	if err := f.store.Clear(); err != nil {
 		return &Error{Kind: KindUnknown, Detail: "не забыть коробку", Err: err}

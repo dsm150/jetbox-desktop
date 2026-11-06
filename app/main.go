@@ -42,8 +42,8 @@ func settingsDir() string {
 	return filepath.Join(dir, "JetBox")
 }
 
-// autostartFlag — запуск при входе в систему. Свой Login Item / SMAppService / Run-ключ
-// приложение не регистрирует: автозапуск ставят установщики (.pkg — LaunchAgent, NSIS — HKLM Run).
+// autostartFlag — запуск при входе в систему. Windows: HKCU\…\Run\JetBox ведёт приложение
+// («Настройки», autostart.go), установщик пишет его при установке; macOS: LaunchAgent ставит .pkg.
 const autostartFlag = "--autostart"
 
 func hasArg(args []string, want string) bool {
@@ -67,6 +67,10 @@ func linkFromArgs(args []string) string {
 
 func main() {
 	logOut := setupLog(settingsDir())
+	if autostartInitOnly(os.Args[1:], newAutostart(), settingsDir()) {
+		log.Printf("autostart-init: version=%s", version)
+		return
+	}
 	dist, err := fs.Sub(frontend, "frontend/dist")
 	if err != nil {
 		log.Fatal(err)
@@ -88,6 +92,7 @@ func main() {
 		Port:     platform.WireGuardPort,
 		OtherVPN: det.Hook(),
 		Online:   netcheck.Online,
+		Logf:     log.Printf,
 	})
 	probe := func(ctx context.Context, ip string) (time.Duration, error) {
 		return homeprobe.Measure(ctx, homeprobe.AddrFor(ip))
@@ -149,6 +154,7 @@ func main() {
 		controller.Options{OtherVPN: det.Hook()})
 	b.ctl = ctl
 	b.tray = newTray(app, b, lang)
+	b.auto, b.dir = newAutostart(), settingsDir()
 
 	// macOS отдаёт ссылку только этим событием; Windows — и в argv, и этим же событием
 	// (Wails сам смотрит argv при одном аргументе) — ссылку из argv берём один раз, ниже.

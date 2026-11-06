@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Chevron } from "./Icons";
 
 // Страница настроек — как JBPage/JBSection/JBListRow мобильных: шапка с заголовком по центру
@@ -55,4 +55,43 @@ export function Row({ label, value, tone, onClick, disabled }: {
   return onClick
     ? <button className="row" onClick={onClick} disabled={disabled}>{body}</button>
     : <div className="row">{body}</div>;
+}
+
+/**
+ * Строка-переключатель — как Toggle/Switch мобильных: подпись слева, тумблер справа, нажимается
+ * вся строка. Тумблер сразу встаёт в новое положение и до ответа приложения не нажимается (двойной
+ * клик иначе выполнился бы в обратном порядке; без приглушения — ответ обычно мгновенный); ответа нет за 3 с (отказ) — возвращается к тому,
+ * что прислало приложение.
+ */
+export function SwitchRow({ label, on, onChange, disabled }: {
+  label: string;
+  on: boolean;
+  onChange: (on: boolean) => void;
+  disabled?: boolean;
+}) {
+  const [pending, setPending] = useState<boolean | null>(null);
+  useEffect(() => setPending(null), [on]);
+  useEffect(() => {
+    if (pending === null) return;
+    const timer = setTimeout(() => setPending(null), 3000);
+    return () => clearTimeout(timer);
+  }, [pending]);
+  const shown = pending ?? on;
+  return (
+    <button
+      className="row"
+      role="switch"
+      aria-checked={shown}
+      disabled={disabled}
+      aria-disabled={pending !== null || undefined}
+      onClick={() => {
+        if (pending !== null) return;
+        setPending(!shown);
+        onChange(!shown);
+      }}
+    >
+      <span className="row-label">{label}</span>
+      <span className={`switch${shown ? " on" : ""}`} aria-hidden="true" />
+    </button>
+  );
 }
