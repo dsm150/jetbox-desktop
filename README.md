@@ -49,6 +49,11 @@ profile becomes theirs, and the first user's app then shows and controls that co
 another user's profile back (it only logs the mismatch with `box.json`). The app does not promise anything about this
 case.
 
+**Upgrading from 1.0.4 and older.** Their `box.json` has no setup-key fingerprint, so the first link of the same
+JetBox (same server and exit) is treated as the same connection, as on iOS for old records (LINK-CONTRACT 1.2 §2.11):
+the computer keeps its identity, and the fingerprint is stored then. From the next new link on, a different key gets
+a new identity. A link of another JetBox or account replaces the connection right away.
+
 **Interrupted replacement.** `replace.json` next to `box.json` is written before the new profile is created and
 removed once the new connection is saved (or rolled back). If it is still there — the app was closed or the computer
 lost power midway — the app finishes the rollback at start (and before connecting): the profile from `box.json` is made
@@ -92,5 +97,8 @@ JetBox подключает компьютер к вашему JetBox одной
 Прежний пир не трогаем — его убирает Кабинет. **Ограничение:** профили службы привязаны к пользователю Windows,
 а служба одна на компьютер — замена вторым пользователем делает активным его профиль, и первый пользователь
 увидит его подключение: чужой профиль приложение назад не переключает, только пишет расхождение в журнал.
+После обновления с 1.0.4 и старше в box.json нет отпечатка ключа: первая ссылка того же JetBox считается тем же
+подключением (запасное правило по удостоверению, как iOS для старых записей), отпечаток записывается тогда же, замена
+по новому ключу — со следующей ссылки. Ссылка другого JetBox или абонента заменяет подключение сразу.
 Прерванную замену (осталась replace.json) приложение доводит откатом при запуске; box.json, чьего профиля в
 службе нет (переустановка), считается отсутствующим.
