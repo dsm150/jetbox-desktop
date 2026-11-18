@@ -52,7 +52,7 @@ func TestEmptyStoreDaemonOnOtherManagementNoQuestion(t *testing.T) {
 	if !reflect.DeepEqual(d.calls, want) {
 		t.Fatalf("calls %v", d.calls)
 	}
-	if b, ok, _ := s.Load(); !ok || b.Identity != "netbird.jet-net.net|sv-demo-exit" || b.ProfileID != "new1" {
+	if b, ok, _ := s.Load(); !ok || b.Identity != "netbird.jet-net.net|sv-demo-exit|Demo" || b.ProfileID != "new1" {
 		t.Fatalf("box %+v %v", b, ok)
 	}
 }
@@ -75,7 +75,7 @@ func TestEmptyStoreSameManagementExitPresentAdopts(t *testing.T) {
 		t.Fatalf("stages %v", stages)
 	}
 	b, ok, _ := s.Load()
-	if !ok || b.Identity != "netbird.jet-net.net|sv-demo-exit" || b.ManagementURL != "https://netbird.jet-net.net" || b.RegisteredAt.IsZero() {
+	if !ok || b.Identity != "netbird.jet-net.net|sv-demo-exit|Demo" || b.ManagementURL != "https://netbird.jet-net.net" || b.RegisteredAt.IsZero() {
 		t.Fatalf("box %+v %v", b, ok)
 	}
 }

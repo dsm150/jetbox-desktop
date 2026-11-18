@@ -100,6 +100,8 @@ func linkSummary(raw string) string {
 		return fmt.Sprintf("ok key=%s len=%d", p.MaskedKey(), len(raw))
 	case jetboxlink.Broken:
 		return fmt.Sprintf("broken len=%d", len(raw))
+	case jetboxlink.Foreign:
+		return fmt.Sprintf("foreign-management len=%d", len(raw))
 	default:
 		return fmt.Sprintf("not-ours len=%d", len(raw))
 	}

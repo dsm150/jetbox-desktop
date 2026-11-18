@@ -63,7 +63,8 @@ treated as no connection.
 
 ## Build
 
-Requirements: Go 1.26+, Node.js + pnpm, NSIS 3 (Windows installer), Xcode (macOS app).
+Requirements: Go (the `toolchain` version in `go.mod`, fetched automatically if another Go is installed),
+Node.js + pnpm, NSIS 3.13 (Windows installer), Xcode (macOS app).
 
 ```sh
 sh test.sh                                     # frontend, go vet/test (core, app), service tests
@@ -76,6 +77,13 @@ packaging/windows/build.sh 1.0.2 4             # build-out/windows-amd64/JetBox-
 Without a local `makensis`, `NSIS_REMOTE=user@windows-host` builds the installer on a Windows machine over ssh
 (`NSIS_SSH_OPTS` for ssh/scp options). Releases are built by [GitHub Actions](.github/workflows/windows.yml)
 from a version tag.
+
+**Reproducible Windows build.** One commit gives the same SHA-256 of `JetBox.exe`, `jetboxd.exe` and
+`JetBox-Setup.exe` locally and in CI: Go exactly from the `toolchain` line of `go.mod` (`GOTOOLCHAIN`),
+`-trimpath -buildvcs=false -ldflags=-buildid=`, `CGO_ENABLED=0`, files checked out without CRLF conversion,
+makensis 3.13 (the build script refuses another version) and `SetDateSave off` in the installer script.
+The scripts write `*.buildinfo` next to the files (Go, Node, pnpm, makensis versions, hashes of inputs);
+`packaging/windows/compare.sh <dir-a> <dir-b>` compares two builds and shows where they differ.
 
 ## License
 

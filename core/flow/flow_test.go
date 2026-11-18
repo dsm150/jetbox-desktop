@@ -56,6 +56,7 @@ type fakeDaemon struct {
 	addCreates   bool              // AddProfile с addErr всё же создал профиль (отмена после создания)
 	activeErr    error             // ответ ActiveProfile
 	listErr      error             // ответ ListProfiles
+	listUsers    []string          // для кого звали ListProfiles
 	removeErr    error             // ответ RemoveProfile (для существующего профиля)
 	removeLocal  bool              // RemoveProfile с removeErr всё же удалил профиль (тайм-аут management)
 	// strict — статусы как у службы: отказ Login → LoginFailed, вход и Down → Idle,
@@ -136,7 +137,8 @@ func (f *fakeDaemon) ActiveProfile(context.Context) (string, string, error) {
 	}
 	return f.activeID(), f.user, nil
 }
-func (f *fakeDaemon) ListProfiles(context.Context, string) ([]daemonclient.Profile, error) {
+func (f *fakeDaemon) ListProfiles(_ context.Context, user string) ([]daemonclient.Profile, error) {
+	f.listUsers = append(f.listUsers, user)
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -258,7 +260,8 @@ func link(t *testing.T, raw string) jetboxlink.Payload {
 func newFlow(t *testing.T, d *fakeDaemon) (*Flow, *Store) {
 	t.Helper()
 	s := NewStore(filepath.Join(t.TempDir(), "box.json"))
-	return New(d, s, Config{Iface: "JetBox", Port: 51830, ExitWait: 50 * time.Millisecond, ExitPoll: time.Millisecond}), s
+	return New(d, s, Config{Iface: "JetBox", Port: 51830, ExitWait: 50 * time.Millisecond, ExitPoll: time.Millisecond,
+		CurrentUser: func() (string, error) { return "ivan", nil }}), s
 }
 
 const demoLink = "jetbox://connect/#k=" + key + "&m=https%3A%2F%2Fnetbird.jet-net.net&e=sv-demo-exit&n=Demo"
@@ -279,7 +282,7 @@ func TestNewBoxHappyPath(t *testing.T) {
 		t.Fatalf("stages %v", stages)
 	}
 	b, ok, _ := s.Load()
-	if !ok || b.Identity != "netbird.jet-net.net|sv-demo-exit" || b.Name != "Demo" || b.ExitNode != "sv-demo-exit" {
+	if !ok || b.Identity != "netbird.jet-net.net|sv-demo-exit|Demo" || b.Name != "Demo" || b.ExitNode != "sv-demo-exit" {
 		t.Fatalf("box %+v", b)
 	}
 }
@@ -376,7 +379,7 @@ func TestSwitchToOtherManagementUsesNewProfile(t *testing.T) {
 	if !reflect.DeepEqual(d.calls, want) {
 		t.Fatalf("calls %v", d.calls)
 	}
-	if b, _, _ := s.Load(); b.Identity != "netbird.jet-net.net|sv-demo-exit" || b.ProfileID != "new1" {
+	if b, _, _ := s.Load(); b.Identity != "netbird.jet-net.net|sv-demo-exit|Demo" || b.ProfileID != "new1" {
 		t.Fatalf("box %+v", b)
 	}
 }
@@ -389,7 +392,7 @@ func TestBoxSavedAfterLoginEvenIfUpFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, ok, _ := s.Load()
-	if !ok || b.Identity != "netbird.jet-net.net|sv-demo-exit" || b.RegisteredAt.IsZero() {
+	if !ok || b.Identity != "netbird.jet-net.net|sv-demo-exit|Demo" || b.RegisteredAt.IsZero() {
 		t.Fatalf("коробка не запомнена после регистрации: %+v %v", b, ok)
 	}
 }
@@ -644,3 +647,13 @@ func TestConcurrentConnectDisconnectNoRace(t *testing.T) {
 }
 
 var _ Daemon = (*daemonclient.Client)(nil)
+
+// Завершающая точка хоста management не делает адрес другим (находка Android).
+func TestSameManagementTrailingDot(t *testing.T) {
+	if !sameManagement("https://netbird.jet-net.net.:443", "https://NetBird.jet-net.net") {
+		t.Fatal(normManagement("https://netbird.jet-net.net.:443"))
+	}
+	if sameManagement("https://netbird.jet-net.net", "https://netbird.jet-net.net.evil") {
+		t.Fatal("чужой хост совпал")
+	}
+}

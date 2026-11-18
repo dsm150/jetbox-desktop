@@ -247,15 +247,21 @@ func (c *Controller) OnLink(ctx context.Context, raw string) {
 			return false
 		}
 		c.nextLink = ""
-		if out == jetboxlink.Broken {
+		if out == jetboxlink.Broken || out == jetboxlink.Foreign {
+			// Испорченная ссылка или ссылка не на сервер JetBox (m вне маски) — свой экран
+			// до вопроса о замене; в службу не идём.
+			kind := flow.KindLinkBroken
+			if out == jetboxlink.Foreign {
+				kind = flow.KindLinkForeign
+			}
 			c.pending, c.opts = nil, flow.Options{}
 			clearError(s)
-			s.Screen, s.ErrorKind, s.ErrorOp = ScreenError, flow.KindLinkBroken.String(), OpConnect
+			s.Screen, s.ErrorKind, s.ErrorOp = ScreenError, kind.String(), OpConnect
 			return true
 		}
 		c.pending, c.opts = &p, flow.Options{}
 		switch {
-		case has && (flow.SameConnection(box, p) || box.Identity == p.BoxIdentity()):
+		case has && (flow.SameConnection(box, p) || flow.SameBox(box, p)):
 			// Своя ссылка или новая ссылка той же коробки (§2.11) — без вопроса.
 			connectNow = true
 			return false
@@ -326,7 +332,8 @@ func (c *Controller) Connect(ctx context.Context) {
 }
 
 func retryable(k flow.Kind) bool {
-	return k != flow.KindLinkExpired && k != flow.KindLinkBroken && k != flow.KindNeedsBrowserLogin
+	return k != flow.KindLinkExpired && k != flow.KindLinkBroken && k != flow.KindNeedsBrowserLogin &&
+		k != flow.KindLinkForeign && k != flow.KindNeedsAdmin
 }
 
 // fail показывает отказ действия op и снимает Busy. link — ссылка, по которой

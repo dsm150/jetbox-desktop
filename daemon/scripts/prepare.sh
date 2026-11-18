@@ -35,7 +35,8 @@ if [ -d "$SRC/.git" ] && [ -z "${DEST:-}" ]; then
     echo "в $SRC незакоммиченные правки — закоммить и выгрузи (export-patches.sh) или убери сам"; exit 1
   fi
   CMP=$(mktemp -d)
-  git -C "$SRC" format-patch -q --no-signature --zero-commit --no-numbered -N -o "$CMP" upstream..HEAD
+  . "$DAEMON/scripts/patchnames.sh"
+  jb_format_patches "$SRC" "$CMP" "$DAEMON/patches" 2>/dev/null || true
   if ! diff -rq "$CMP" "$DAEMON/patches" >/dev/null; then
     rm -rf "$CMP"
     echo "в $SRC коммиты, которых нет в daemon/patches — сначала export-patches.sh (или удали дерево сам)"; exit 1

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -227,26 +228,27 @@ func TestReplaceStepFailuresRollBack(t *testing.T) {
 }
 
 // Login уже сделал новый профиль активным и зарегистрировал пир: сбой явного
-// SwitchProfile после входа — только журнал, не откат.
-func TestReplaceSwitchAfterLoginFailsContinues(t *testing.T) {
+// SwitchProfile после входа — до точки фиксации, значит откат к состоянию до замены.
+func TestReplaceSwitchAfterLoginFailsRollsBack(t *testing.T) {
 	d := &fakeDaemon{status: "Connected", nets: demoNets, switchErr: map[string]error{"new1": errors.New("boom")}}
 	f, s := newFlow(t, d)
-	var logged []string
-	f.cfg.Logf = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
-	_ = s.Save(registeredBox(t, demoLink))
-	if _, err := f.Connect(context.Background(), link(t, reissuedDemoLink), Options{ConfirmSwitch: true}, nil); err != nil {
+	old := registeredBox(t, demoLink)
+	_ = s.Save(old)
+	_, err := f.Connect(context.Background(), link(t, reissuedDemoLink), Options{ConfirmSwitch: true}, nil)
+	if KindOf(err) != KindUnknown {
 		t.Fatal(err)
 	}
-	if hasCall(d.calls, "RemoveProfile") || len(logged) != 1 {
-		t.Fatalf("calls %v log %v", d.calls, logged)
+	want := append(append([]string{}, replaceCalls[:6]...), "Down", "SwitchProfile default", "Up", "RemoveProfile new1")
+	if !reflect.DeepEqual(d.calls, want) || d.activeID() != "default" {
+		t.Fatalf("calls %v active %s", d.calls, d.activeID())
 	}
-	if b, _, _ := s.Load(); b.ProfileID != "new1" {
-		t.Fatalf("box %+v", b)
+	if b, _, _ := s.Load(); b.KeyFingerprint != old.KeyFingerprint || b.ProfileID != "" {
+		t.Fatalf("box.json должен остаться прежним: %+v", b)
 	}
 }
 
 // Вернуться на прежний профиль не вышло — новый активен: удалить его служба не даст,
-// а Up поднял бы незарегистрированный. Только журнал.
+// а Up поднял бы незарегистрированный. Только журнал; откат (с Up прежнего) доводит сверка.
 func TestRollbackSwitchBackFailsStops(t *testing.T) {
 	d := &fakeDaemon{status: "Connected", nets: demoNets, loginErr: status.Error(codes.PermissionDenied, "invalid setup key"),
 		switchErr: map[string]error{"default": errors.New("boom")}}
@@ -268,7 +270,8 @@ func TestRollbackSwitchBackFailsStops(t *testing.T) {
 	if err := f.Reconnect(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(d.calls[:3], []string{"Down", "SwitchProfile default", "RemoveProfile new1"}) || d.activeID() != "default" {
+	// Сверка доводит откат: прежний профиль и Up — защита была включена до замены.
+	if !reflect.DeepEqual(d.calls[:4], []string{"Down", "SwitchProfile default", "Up", "RemoveProfile new1"}) || d.activeID() != "default" {
 		t.Fatalf("calls %v", d.calls)
 	}
 	if _, ok := s.LoadReplace(); ok {
@@ -732,5 +735,185 @@ func TestCloudLinkNoDefaultExit(t *testing.T) {
 	}
 	if !hasCall(d.calls, "SelectExit") {
 		t.Fatalf("своя ссылка — выход по сохранённому выбору: %v", d.calls)
+	}
+}
+
+// Замену прервали после входа: новый профиль зарегистрирован, служба (патч 0008) удалять
+// его без прав отказывается (PRIVILEGE_REQUIRED). Не повторять: журнал, запись о замене
+// стереть, профиль оставить — иначе сверка повторяла бы удаление на каждом запуске.
+func TestRemoveNewRegisteredNeedsPrivilegeIsNotRetried(t *testing.T) {
+	d, f, s := interrupted(t, "")
+	var logged []string
+	f.cfg.Logf = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+	d.removeErr = privilegeErr(t, "Removing a registered profile requires root.")
+	changed, err := f.Recover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.LoadReplace(); ok {
+		t.Fatal("запись о замене осталась — сверка будет повторять удаление")
+	}
+	if !reflect.DeepEqual(d.profiles, []string{"new1"}) || !changed || !reflect.DeepEqual(d.calls, []string{"Down", "SwitchProfile default", "RemoveProfile new1"}) {
+		t.Fatalf("profiles %v changed %v calls %v", d.profiles, changed, d.calls)
+	}
+	if !slices.ContainsFunc(logged, func(l string) bool { return strings.Contains(l, "без прав администратора") }) {
+		t.Fatalf("нет записи в журнале: %v", logged)
+	}
+	d.calls = nil
+	if _, err := f.Recover(context.Background()); err != nil || hasCall(d.calls, "RemoveProfile") {
+		t.Fatalf("повтор: err=%v calls=%v", err, d.calls)
+	}
+}
+
+// Откат неудачной замены тем же путём: удалить новый нельзя без прав — не повторять, запись стереть.
+func TestRollbackRemoveNeedsPrivilege(t *testing.T) {
+	d := &fakeDaemon{status: "Connected", nets: demoNets,
+		loginErr: status.Error(codes.PermissionDenied, "invalid setup key")}
+	f, s := newFlow(t, d)
+	_ = s.Save(registeredBox(t, demoLink))
+	d.removeErr = privilegeErr(t, "Removing a registered profile requires root.")
+	_, err := f.Connect(context.Background(), link(t, reissuedDemoLink), Options{ConfirmSwitch: true}, nil)
+	if KindOf(err) != KindLinkExpired {
+		t.Fatalf("err %v", err)
+	}
+	if _, ok := s.LoadReplace(); ok {
+		t.Fatal("запись о замене осталась")
+	}
+	if !hasCall(d.calls, "RemoveProfile new1") || d.activeID() != "default" {
+		t.Fatalf("calls %v active %s", d.calls, d.activeID())
+	}
+}
+
+// Точка фиксации — сохранение коробки. Сбой Save после входа — откат к состоянию до
+// замены: прежний профиль, Up (защита была включена), box.json прежний, новый профиль
+// убирается (зарегистрирован — служба не даст без прав: журнал, без повтора).
+func TestReplaceSaveFailsRollsBack(t *testing.T) {
+	for name, removeErr := range map[string]error{
+		"новый удалён":              nil,
+		"новый не удалить без прав": privilegeErr(t, "Removing a registered profile requires root."),
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := &fakeDaemon{status: "Connected", nets: demoNets}
+			f, s := newFlow(t, d)
+			old := registeredBox(t, demoLink)
+			_ = s.Save(old)
+			d.removeErr = removeErr
+			s.saveErr = errors.New("диск полон")
+			_, err := f.Connect(context.Background(), link(t, reissuedDemoLink), Options{ConfirmSwitch: true}, nil)
+			if err == nil {
+				t.Fatal("ждали отказ")
+			}
+			s.saveErr = nil
+			want := append(append([]string{}, replaceCalls[:6]...), "Down", "SwitchProfile default", "Up", "RemoveProfile new1")
+			if !reflect.DeepEqual(d.calls, want) || d.activeID() != "default" {
+				t.Fatalf("calls %v active %s", d.calls, d.activeID())
+			}
+			if b, _, _ := s.Load(); b.KeyFingerprint != old.KeyFingerprint || b.ProfileID != "" {
+				t.Fatalf("box.json должен остаться прежним: %+v", b)
+			}
+			if _, ok := s.LoadReplace(); ok {
+				t.Fatal("запись о замене осталась")
+			}
+		})
+	}
+}
+
+// После фиксации (коробка сохранена) сбой Up — обычная ошибка подключения, без отката.
+func TestReplaceUpFailsAfterCommitNoRollback(t *testing.T) {
+	d := &fakeDaemon{status: "Connected", nets: demoNets, upErr: status.Error(codes.Unavailable, "connection refused")}
+	f, s := newFlow(t, d)
+	_ = s.Save(registeredBox(t, demoLink))
+	_, err := f.Connect(context.Background(), link(t, reissuedDemoLink), Options{ConfirmSwitch: true}, nil)
+	if err == nil {
+		t.Fatal("ждали отказ Up")
+	}
+	if hasCall(d.calls, "SwitchProfile default") || hasCall(d.calls, "RemoveProfile") || d.activeID() != "new1" {
+		t.Fatalf("откат после фиксации: calls %v", d.calls)
+	}
+	l := link(t, reissuedDemoLink)
+	if b, _, _ := s.Load(); b.ProfileID != "new1" || b.KeyFingerprint != l.KeyFingerprint() {
+		t.Fatalf("коробка — новое подключение: %+v", b)
+	}
+	if _, ok := s.LoadReplace(); ok {
+		t.Fatal("запись о замене после фиксации")
+	}
+}
+
+// Сверка доводит прерванную замену и поднимает прежнее подключение, если оно было включено
+// (WasOn), — и только один раз: запись без WasOn после этого.
+func TestRecoverUpWhenWasOn(t *testing.T) {
+	d := &fakeDaemon{status: "Idle", nets: demoNets, profiles: []string{"new1"}, names: map[string]string{"new1": "jetbox-1"},
+		removeErr: errors.New("management недоступен")}
+	f, s := newFlow(t, d)
+	_ = s.Save(registeredBox(t, demoLink))
+	_ = s.SaveReplace(Replace{OldID: "default", NewName: "jetbox-1", NewID: "new1", NewUser: "ivan", WasOn: true, At: time.Now()})
+	changed, err := f.Recover(context.Background())
+	if err != nil || !changed || !reflect.DeepEqual(d.calls, []string{"Up", "RemoveProfile new1"}) {
+		t.Fatalf("changed=%v err=%v calls=%v", changed, err, d.calls)
+	}
+	j, ok := s.LoadReplace()
+	if !ok || j.WasOn {
+		t.Fatalf("запись: %+v %v", j, ok)
+	}
+	d.calls, d.removeErr = nil, nil
+	if _, err := f.Recover(context.Background()); err != nil || hasCall(d.calls, "Up") || !hasCall(d.calls, "RemoveProfile new1") {
+		t.Fatalf("повтор: err=%v calls=%v", err, d.calls)
+	}
+	if _, ok := s.LoadReplace(); ok {
+		t.Fatal("запись осталась")
+	}
+}
+
+// Отказ службы по правам на SetConfig (management вне маски, патч 0008) — KindNeedsAdmin.
+func TestConfigureNeedsAdmin(t *testing.T) {
+	d := &fakeDaemon{status: "NeedsLogin", nets: demoNets, configureErr: privilegeErr(t, "Connecting to a management server outside *.jet-net.net requires root.")}
+	f, _ := newFlow(t, d)
+	if _, err := f.Connect(context.Background(), link(t, demoLink), Options{}, nil); KindOf(err) != KindNeedsAdmin {
+		t.Fatalf("Configure: %v", err)
+	}
+	d2 := &fakeDaemon{status: "Connected", nets: demoNets, configureErr: d.configureErr}
+	f2, s2 := newFlow(t, d2)
+	_ = s2.Save(registeredBox(t, demoLink))
+	if _, err := f2.Connect(context.Background(), link(t, reissuedDemoLink), Options{ConfirmSwitch: true}, nil); KindOf(err) != KindNeedsAdmin {
+		t.Fatalf("ConfigureProfile: %v", err)
+	}
+}
+
+// AddProfile прервали до ответа (ID нового неизвестен): новый профиль заведён на
+// вызывающего, а не на пользователя прежнего профиля — его ищут по имени у вызывающего.
+// Пользователь пишется в replace.json до AddProfile.
+func TestInterruptedAddProfileSearchedAtCaller(t *testing.T) {
+	d := &fakeDaemon{status: "Connected", nets: demoNets, active: "old7", user: `PC\other`, profiles: []string{"old7"},
+		addErr: context.Canceled, addCreates: true, listErr: errors.New("служба занята")}
+	f, s := newFlow(t, d)
+	f.cfg.CurrentUser = func() (string, error) { return `PC\petr`, nil }
+	b := registeredBox(t, demoLink)
+	b.ProfileID, b.ProfileUser = "old7", `PC\other`
+	_ = s.Save(b)
+	if _, err := f.Connect(context.Background(), link(t, reissuedDemoLink), Options{ConfirmSwitch: true}, nil); err == nil {
+		t.Fatal("ждали отказ AddProfile")
+	}
+	j, ok := s.LoadReplace()
+	if !ok || j.NewID != "" || j.NewUser != `PC\petr` || j.OldUser != `PC\other` {
+		t.Fatalf("запись: %+v %v", j, ok)
+	}
+	d.listErr, d.listUsers = nil, nil
+	if _, err := f.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.listUsers) == 0 || d.listUsers[len(d.listUsers)-1] != `PC\petr` || !hasCall(d.calls, "RemoveProfile new2") {
+		t.Fatalf("искали у %v, calls %v", d.listUsers, d.calls)
+	}
+
+	// Запись 1.0.5 без NewUser — тоже у вызывающего, не у прежнего пользователя.
+	d2 := &fakeDaemon{status: "Idle", active: "old7", user: `PC\other`, profiles: []string{"old7", "new2"},
+		names: map[string]string{"new2": "jetbox-1"}}
+	f2, s2 := newFlow(t, d2)
+	f2.cfg.CurrentUser = func() (string, error) { return `PC\petr`, nil }
+	_ = s2.SaveReplace(Replace{OldID: "old7", OldUser: `PC\other`, NewName: "jetbox-1", At: time.Now()})
+	// Первым ListProfiles сверка проверяет прежний профиль (у его пользователя), затем ищет новый.
+	if _, err := f2.Recover(context.Background()); err != nil || d2.listUsers[len(d2.listUsers)-1] != `PC\petr` ||
+		!hasCall(d2.calls, "RemoveProfile new2") {
+		t.Fatalf("err %v искали у %v calls %v", err, d2.listUsers, d2.calls)
 	}
 }

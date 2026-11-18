@@ -44,6 +44,8 @@ func TestRedactLinks(t *testing.T) {
 		{"https://box.jet-net.net/connect#k=" + key,
 			"<link ok key=••••••••…3301 len=70>"},
 		{"jetbox://connect#k=short", "<link broken len=24>"},
+		{"jetbox://connect#k=" + key + "&m=https://evil.example",
+			"<link foreign-management len=78>"},
 		{"a jetbox:x b jetbox://connect#k=" + key + "\n",
 			"a <link not-ours len=8> b <link ok key=••••••••…3301 len=55>\n"},
 	}

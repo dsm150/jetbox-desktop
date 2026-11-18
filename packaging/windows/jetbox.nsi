@@ -3,6 +3,9 @@ Unicode True
 ManifestDPIAware true
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
+; Воспроизводимость: без даты изменения файлов в установщике (у scp и checkout она каждый раз своя),
+; иначе одинаковые файлы дают разный sha256 установщика.
+SetDateSave off
 
 !ifndef BUILD
   !define BUILD 0

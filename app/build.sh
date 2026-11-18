@@ -10,7 +10,12 @@ BUILD=${3:-1}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 APP="$ROOT/app"
 OUT="$ROOT/build-out"
-LDFLAGS="-s -w -X main.version=$VERSION"
+# Воспроизводимость (локально = CI, одинаковые sha256): -trimpath и -buildvcs=false убирают пути и метку
+# коммита, -buildid= — идентификатор сборки, Go — ровно версия из строки toolchain в go.mod.
+LDFLAGS="-s -w -buildid= -X main.version=$VERSION"
+GOTOOLCHAIN=$(sed -n 's/^toolchain \(go[0-9.]*\)$/\1/p' "$ROOT/go.mod")
+[ -n "$GOTOOLCHAIN" ] || { echo "в go.mod нет строки toolchain goX.Y.Z" >&2; exit 1; }
+export GOTOOLCHAIN
 # Минимальная macOS (LSMinimumSystemVersion и -mmacosx-version-min). 13.0 — не выбор,
 # а нижняя граница тулчейна: рантайм Go 1.27 собран под macOS 13. Переопределяется
 # окружением (MACOS_MIN=14.0 app/build.sh darwin …), но ниже 13 бинарь не запустится.
@@ -49,6 +54,19 @@ WAILS_WORK=$(sh "$APP/wails/prepare.sh")
 
 (cd "$APP/frontend" && pnpm install --frozen-lockfile --ignore-scripts >/dev/null && pnpm build >/dev/null)
 
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+# <файл>.buildinfo — чем собран файл: packaging/windows/compare.sh сверяет их у двух сборок.
+buildinfo() { # out-файл
+  {
+    echo "go: $(go env GOVERSION)"
+    echo "node: $(node -v)"
+    echo "pnpm: $(pnpm -v)"
+    echo "frontend/dist: $(cd "$APP/frontend/dist" && find . -type f | LC_ALL=C sort | while IFS= read -r f; do echo "$(sha256 "$f" | cut -d' ' -f1) $f"; done | sha256 | cut -d' ' -f1)"
+    echo "wails: $(sed -n 's/^replace github.com\/wailsapp\/wails\/v3 => //p' "$ROOT/go.mod") + $(cat "$ROOT"/app/wails/patches/*.patch | sha256 | cut -d' ' -f1)"
+    echo "$(basename "$1"): $(sha256 "$1" | cut -d' ' -f1)"
+  } > "$1.buildinfo"
+}
+
 build_windows() {
   mkdir -p "$OUT/windows-amd64"
   TMP=$(mktemp -d)
@@ -60,8 +78,11 @@ build_windows() {
     -product-ver-major "$VMAJ" -product-ver-minor "$VMIN" -product-ver-patch "$VPAT" -product-ver-build "$BUILD" \
     -file-version "$VERSION.$BUILD" -product-version "$VERSION.$BUILD" \
     versioninfo.json)
-  (cd "$ROOT" && GOWORK="$WAILS_WORK" GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags production -trimpath \
+  # Без CGO: Wails v3 на Windows говорит с WebView2 через COM на чистом Go.
+  (cd "$ROOT" && GOWORK="$WAILS_WORK" GOOS=windows GOARCH=amd64 GOAMD64=v1 CGO_ENABLED=0 \
+    go build -tags production -trimpath -buildvcs=false \
     -ldflags "$LDFLAGS -H windowsgui" -o "$OUT/windows-amd64/JetBox.exe" ./app)
+  buildinfo "$OUT/windows-amd64/JetBox.exe"
   cleanup # .syso не должен попасть в сборку macOS (target all)
   TMP=""
   echo "$OUT/windows-amd64/JetBox.exe"
@@ -74,7 +95,7 @@ build_darwin() {
   for ARCH in amd64 arm64; do
     (cd "$ROOT" && GOOS=darwin GOARCH=$ARCH CGO_ENABLED=1 MACOSX_DEPLOYMENT_TARGET=$MACOS_MIN \
       CGO_CFLAGS="-mmacosx-version-min=$MACOS_MIN" CGO_LDFLAGS="-mmacosx-version-min=$MACOS_MIN" \
-      GOWORK="$WAILS_WORK" go build -tags production -trimpath -ldflags "$LDFLAGS" -o "$OUT/darwin-$ARCH/JetBox" ./app)
+      GOWORK="$WAILS_WORK" go build -tags production -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o "$OUT/darwin-$ARCH/JetBox" ./app)
   done
   lipo -create -output "$BUNDLE/Contents/MacOS/JetBox" "$OUT/darwin-amd64/JetBox" "$OUT/darwin-arm64/JetBox"
   sed -e "s/__VERSION__/$VERSION/" -e "s/__BUILD__/$BUILD/" -e "s/__MINOS__/$MACOS_MIN/" \

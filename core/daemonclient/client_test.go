@@ -369,11 +369,11 @@ func TestDisableServerSSHAllProfiles(t *testing.T) {
 	}
 }
 
-// Новый профиль заводится для пользователя активного профиля; переключение и удаление —
-// с тем же пользователем.
+// Новый профиль заводится для вызывающего (здесь он же пользователь активного профиля);
+// переключение и удаление — с тем же пользователем.
 func TestAddSwitchRemoveProfile(t *testing.T) {
 	c, fs := newTestClient(t)
-	fakeUser(t, `PC\petr`)
+	fakeUser(t, "ivan")
 	ctx := context.Background()
 	id, user, err := c.AddProfile(ctx, "jetbox-1763300000")
 	if err != nil || id != "0123abcd" || user != "ivan" {
@@ -456,5 +456,21 @@ func TestListProfiles(t *testing.T) {
 	}
 	if _, err := c.ListProfiles(context.Background(), "petr"); err != nil || fs.listUser != "petr" {
 		t.Fatal(err, fs.listUser)
+	}
+}
+
+// Новый профиль — на вызывающего: активный профиль другого пользователя ОС не даёт своего
+// имени (иначе откат замены удалял бы чужой профиль — служба потребует прав).
+func TestAddProfileForCallerNotForeignActive(t *testing.T) {
+	c, fs := newTestClient(t) // активный — профиль пользователя ivan
+	fakeUser(t, `PC\petr`)
+	_, user, err := c.AddProfile(context.Background(), "jetbox-1")
+	if err != nil || user != `PC\petr` || fs.added.GetUsername() != `PC\petr` {
+		t.Fatal(user, err, fs.added)
+	}
+	// Свой активный (регистр другой) — написание из активного: тот же каталог профилей.
+	fakeUser(t, "IVAN")
+	if _, user, err = c.AddProfile(context.Background(), "jetbox-2"); err != nil || user != "ivan" {
+		t.Fatal(user, err)
 	}
 }

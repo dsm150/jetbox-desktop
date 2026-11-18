@@ -1,0 +1,182 @@
+{
+  "about": "Общие векторы удостоверения подключения (LINK-CONTRACT ред. 1.3, §2.11). link — ссылка целиком; identity — строка удостоверения; about — что проверяем. Удостоверение решает только, спрашивать ли «переключить?». Раздел compare — сравнение сохранённой записи (поля m, e, n; null — поля нет) со ссылкой: same — без вопроса, ask — «переключить?». Отпечаток setup key решает раньше и в compare не входит. Источник — iOS (JetBox_iOS/jetbox-ios/NetBirdTests/identity.json).",
+  "cases": [
+    {
+      "link": "https://box.jet-net.net/connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=sv-acme-exit&n=%D0%9E%D1%84%D0%B8%D1%81",
+      "identity": "netbird.jet-net.net|sv-acme-exit|Офис",
+      "about": "коробка: хост|e|n, n после percent-decoding"
+    },
+    {
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2FNETBIRD.Jet-Net.NET%2F&e=sv-acme-exit&n=%D0%9E%D1%84%D0%B8%D1%81",
+      "identity": "netbird.jet-net.net|sv-acme-exit|Офис",
+      "about": "хост в нижнем регистре, слэш не важен, своя схема = Universal Link"
+    },
+    {
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net%3A33073&e=sv-acme-exit&n=X",
+      "identity": "netbird.jet-net.net|sv-acme-exit|X",
+      "about": "порт в удостоверение не входит"
+    },
+    {
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=sv-acme-exit",
+      "identity": "netbird.jet-net.net|sv-acme-exit|",
+      "about": "e без n: пустая третья часть"
+    },
+    {
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=cl-exit&n=JetBox%20%C2%B7%20ivan&t=jbd_aaa&x=0",
+      "identity": "netbird.jet-net.net|cl-exit|JetBox · ivan",
+      "about": "облако: различает n, t и x не входят"
+    },
+    {
+      "link": "jetbox://connect#k=22222222-3333-4444-8555-666666666666&m=https%3A%2F%2Fnetbird.jet-net.net&e=cl-exit&n=JetBox%20%C2%B7%20ivan&t=jbd_bbb&x=0",
+      "identity": "netbird.jet-net.net|cl-exit|JetBox · ivan",
+      "about": "«Новая ссылка» того же абонента (новые k и t) — то же удостоверение"
+    },
+    {
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=cl-exit&n=JetBox%20%C2%B7%20petr&t=jbd_ccc&x=0",
+      "identity": "netbird.jet-net.net|cl-exit|JetBox · petr",
+      "about": "другой облачный абонент — другое удостоверение"
+    },
+    {
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=sv-acme-exit&n=office",
+      "identity": "netbird.jet-net.net|sv-acme-exit|office",
+      "about": "регистр n учитывается (ниже — Office)"
+    },
+    {
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=sv-acme-exit&n=Office",
+      "identity": "netbird.jet-net.net|sv-acme-exit|Office",
+      "about": "регистр n учитывается (выше — office)"
+    },
+    {
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=sv-acme-exit&n=%20Office%20",
+      "identity": "netbird.jet-net.net|sv-acme-exit|Office",
+      "about": "пробелы по краям значения обрезаются"
+    },
+    {
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&n=%D0%94%D0%BE%D0%BC",
+      "identity": "netbird.jet-net.net|n:Дом",
+      "about": "старая ссылка без e: хост|n:<n>"
+    },
+    {
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&t=jbd_aaa",
+      "identity": "netbird.jet-net.net|",
+      "about": "без e и n: только хост (t не входит)"
+    },
+    {
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&e=sv-acme-exit&n=X",
+      "identity": "netbird.jet-net.net|sv-acme-exit|X",
+      "about": "m нет — хост дефолтного management"
+    },
+    {
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=sv-acme-exit&n=X&p=ios",
+      "identity": "netbird.jet-net.net|sv-acme-exit|X",
+      "about": "p не входит"
+    },
+    {
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net.&e=sv-acme-exit&n=X",
+      "identity": "netbird.jet-net.net|sv-acme-exit|X",
+      "about": "завершающая точка хоста m срезается (находка Android)"
+    }
+  ],
+  "compare": [
+    {
+      "stored": {
+        "m": "https://netbird.jet-net.net",
+        "e": "sv-acme-exit",
+        "n": null
+      },
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=sv-acme-exit&n=Office",
+      "expect": "same",
+      "about": "запись без n (старый формат хост|e) и коробочный e — сравнение без n"
+    },
+    {
+      "stored": {
+        "m": "https://netbird.jet-net.net",
+        "e": "sv-acme-exit",
+        "n": "Office"
+      },
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=sv-acme-exit",
+      "expect": "same",
+      "about": "ссылка без n (старый QR) против записи с n — сравнение без n"
+    },
+    {
+      "stored": {
+        "m": "https://netbird.jet-net.net",
+        "e": "cl-exit",
+        "n": null
+      },
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=cl-exit&n=JetBox%20%C2%B7%20ivan&t=jbd_a&x=0",
+      "expect": "ask",
+      "about": "общий e облака без n у записи — без n не сравниваем"
+    },
+    {
+      "stored": {
+        "m": "https://netbird.jet-net.net",
+        "e": "cl-exit",
+        "n": "JetBox · ivan"
+      },
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=cl-exit&n=JetBox%20%C2%B7%20petr&t=jbd_b&x=0",
+      "expect": "ask",
+      "about": "разные облачные абоненты с общим e"
+    },
+    {
+      "stored": {
+        "m": "https://netbird.jet-net.net",
+        "e": "cl-exit",
+        "n": "JetBox · ivan"
+      },
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=cl-exit&n=JetBox%20%C2%B7%20ivan&t=jbd_c&x=0",
+      "expect": "same",
+      "about": "свой облачный абонент, «Новая ссылка» (новый t)"
+    },
+    {
+      "stored": {
+        "m": "https://netbird.jet-net.net",
+        "e": "cl-exit",
+        "n": "JetBox · ivan"
+      },
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=cl-exit&x=0",
+      "expect": "ask",
+      "about": "общий e облака, ссылка без n — без n не сравниваем"
+    },
+    {
+      "stored": {
+        "m": "https://netbird.jet-net.net",
+        "e": "sv-acme-exit",
+        "n": "Office"
+      },
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=sv-acme-exit&n=office",
+      "expect": "ask",
+      "about": "регистр n учитывается"
+    },
+    {
+      "stored": {
+        "m": "https://netbird.jet-net.net",
+        "e": "sv-acme-exit",
+        "n": "Office"
+      },
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=sv-acme-exit&n=New%20office",
+      "expect": "ask",
+      "about": "площадку переименовали — вопрос (принятая цена)"
+    },
+    {
+      "stored": {
+        "m": "https://netbird.jet-net.net",
+        "e": "sv-acme-exit",
+        "n": null
+      },
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&e=sv-other-exit&n=Office",
+      "expect": "ask",
+      "about": "другой e — другая коробка, даже без n"
+    },
+    {
+      "stored": {
+        "m": "https://netbird.jet-net.net",
+        "e": null,
+        "n": "Дом"
+      },
+      "link": "jetbox://connect#k=11111111-2222-4333-8444-555555555555&m=https%3A%2F%2Fnetbird.jet-net.net&n=%D0%94%D0%BE%D0%BC",
+      "expect": "same",
+      "about": "старые ссылки без e: хост|n"
+    }
+  ]
+}

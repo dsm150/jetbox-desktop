@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -26,10 +27,18 @@ const (
 	// KindNeedsLink — компьютер помнит коробку, но служба не зарегистрирована:
 	// открыть ссылку подключения ещё раз.
 	KindNeedsLink
+	// KindNeedsAdmin — служба отказала по правам (ErrorInfo PRIVILEGE_REQUIRED, патч 0008:
+	// management вне маски, чужой или зарегистрированный профиль): «Это действие требует
+	// прав администратора». Нормальный путь приложения его не встречает — защита от
+	// расхождения правил ссылки и службы.
+	KindNeedsAdmin
+	// KindLinkForeign — ссылка ведёт не на сервер JetBox (m вне маски, jetboxlink.Foreign).
+	KindLinkForeign
 )
 
 var kindNames = [...]string{"None", "Unknown", "ServiceMissing", "NoInternet", "ServerUnreachable",
-	"LinkExpired", "LinkBroken", "NeedsBrowserLogin", "OtherVPN", "OtherBox", "NeedsLink"}
+	"LinkExpired", "LinkBroken", "NeedsBrowserLogin", "OtherVPN", "OtherBox", "NeedsLink", "NeedsAdmin",
+	"LinkForeign"}
 
 func (k Kind) String() string {
 	if k < 0 || int(k) >= len(kindNames) {
@@ -66,6 +75,30 @@ func KindOf(err error) Kind {
 	return KindUnknown
 }
 
+// Отказ службы по правам — PermissionDenied с ErrorInfo этой пары (апстрим
+// client/internal/ipcauth: ErrorReasonPrivilegeRequired, ErrorDomain).
+const (
+	privilegeReason = "PRIVILEGE_REQUIRED"
+	privilegeDomain = "daemon.netbird.io"
+)
+
+// NeedsPrivilege — err — отказ службы «нужны права администратора»: PermissionDenied с
+// ErrorInfo{Reason: PRIVILEGE_REQUIRED, Domain: daemon.netbird.io}. Тот же код
+// PermissionDenied management отдаёт на протухший вход пира — различаем по детали.
+func NeedsPrivilege(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.PermissionDenied {
+		return false
+	}
+	for _, d := range st.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok &&
+			info.GetReason() == privilegeReason && info.GetDomain() == privilegeDomain {
+			return true
+		}
+	}
+	return false
+}
+
 func containsAny(s string, subs ...string) bool {
 	for _, sub := range subs {
 		if strings.Contains(s, sub) {
@@ -77,6 +110,8 @@ func containsAny(s string, subs ...string) bool {
 
 // classifyLogin сводит ошибку Login/Up службы к виду отказа. Тексты management апстрима
 // не стабильны, поэтому смотрим и код, и подстроки. Порядок важен:
+//   - отказ службы по правам (ErrorInfo PRIVILEGE_REQUIRED) — первым: тот же код
+//     PermissionDenied без детали — это management про ссылку;
 //   - «originally enrolled via SSO» — пир заведён через браузер, ключом не войти;
 //   - InvalidArgument про setup-key — ключ в ссылке испорчен (формат);
 //   - упоминание ключа или «couldn't add peer» — ключ протух/отозван/исчерпан;
@@ -90,6 +125,9 @@ func containsAny(s string, subs ...string) bool {
 func classifyLogin(err error) Kind {
 	if err == nil {
 		return KindNone
+	}
+	if NeedsPrivilege(err) {
+		return KindNeedsAdmin
 	}
 	st, _ := status.FromError(err)
 	msg := strings.ToLower(st.Message())

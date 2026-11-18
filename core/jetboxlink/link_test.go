@@ -1,6 +1,8 @@
 package jetboxlink
 
 import (
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -104,8 +106,8 @@ func TestManagementDefaultsWhenMissingOrEmpty(t *testing.T) {
 
 func TestManagementNormalisation(t *testing.T) {
 	cases := map[string]string{
-		"jetbox://connect#k=" + key + "&m=https://Mgmt.Example.NET/":      "https://mgmt.example.net",
-		"jetbox://connect#k=" + key + "&m=https://mgmt.example.net:33073": "https://mgmt.example.net:33073",
+		"jetbox://connect#k=" + key + "&m=https://Mgmt.Jet-Net.NET/":      "https://mgmt.jet-net.net",
+		"jetbox://connect#k=" + key + "&m=https://mgmt.jet-net.net:33073": "https://mgmt.jet-net.net:33073",
 	}
 	for raw, want := range cases {
 		if got := payload(t, raw).ManagementURL; got != want {
@@ -115,8 +117,8 @@ func TestManagementNormalisation(t *testing.T) {
 }
 
 func TestParameterOrderAndUnknownParametersDoNotMatter(t *testing.T) {
-	p := payload(t, "jetbox://connect#zz=1&e=node&m=https://mgmt.example.net&k="+key+"&v=9")
-	if p.ExitNode != "node" || p.ManagementURL != "https://mgmt.example.net" {
+	p := payload(t, "jetbox://connect#zz=1&e=node&m=https://mgmt.jet-net.net&k="+key+"&v=9")
+	if p.ExitNode != "node" || p.ManagementURL != "https://mgmt.jet-net.net" {
 		t.Fatalf("got %+v", p)
 	}
 }
@@ -177,7 +179,7 @@ func TestMissingFragmentIsNotOurs(t *testing.T) {
 }
 
 func TestMissingKeyIsNotOurs(t *testing.T) {
-	for _, raw := range []string{"https://box.jet-net.net/connect#m=https://mgmt.example.net", "jetbox://connect#k="} {
+	for _, raw := range []string{"https://box.jet-net.net/connect#m=https://mgmt.jet-net.net", "jetbox://connect#k="} {
 		if outcome(raw) != NotOurs {
 			t.Errorf("%q: want NotOurs", raw)
 		}
@@ -197,15 +199,45 @@ func TestMalformedKeyIsBroken(t *testing.T) {
 	}
 }
 
-func TestNonHttpsManagementIsBroken(t *testing.T) {
+// Маска (LINK-CONTRACT §2.3) проверяется до нормализации: не https, без схемы, мусор —
+// «не на сервер JetBox», а не «повреждена».
+func TestNonHttpsManagementIsForeign(t *testing.T) {
 	for _, raw := range []string{
-		"jetbox://connect#k=" + key + "&m=http://mgmt.example.net",
-		"jetbox://connect#k=" + key + "&m=mgmt.example.net",
+		"jetbox://connect#k=" + key + "&m=http://mgmt.jet-net.net",
+		"jetbox://connect#k=" + key + "&m=mgmt.jet-net.net",
 		"jetbox://connect#k=" + key + "&m=javascript:alert(1)",
 	} {
-		if outcome(raw) != Broken {
-			t.Errorf("%q: want Broken", raw)
+		if outcome(raw) != Foreign {
+			t.Errorf("%q: want Foreign", raw)
 		}
+	}
+}
+
+// m вне маски — Foreign до любого действия; без m — management по умолчанию (в маске).
+func TestManagementMaskInParse(t *testing.T) {
+	if outcome("jetbox://connect#k="+key) != OK {
+		t.Error("без m — OK")
+	}
+	for _, m := range []string{
+		"https://evil.example",
+		"https://netbird.jet-net.net/api",      // путь: normalizedManagement бы пропустил
+		"https%3A%2F%2Fevil.example",           // после percent-decoding — чужой
+		"https://jet-net.net",                  // сам домен
+		"https://netbird.jet-net.net.evil.com", // наш хост в начале чужого
+		"https://1.2.3.4",
+		"https://netbird.jet-net.net:",
+	} {
+		raw := "jetbox://connect#k=" + key + "&m=" + m
+		if got := outcome(raw); got != Foreign {
+			t.Errorf("%q: %v, want Foreign", raw, got)
+		}
+	}
+	// Ключ испорчен — Broken раньше маски.
+	if got := outcome("jetbox://connect#k=bad&m=https://evil.example"); got != Broken {
+		t.Errorf("испорченный ключ: %v, want Broken", got)
+	}
+	if p := payload(t, "jetbox://connect#k="+key+"&m=https%3A%2F%2Fbox2.jet-net.net%3A33073"); p.ManagementURL != "https://box2.jet-net.net:33073" {
+		t.Errorf("закодированный m в маске: %q", p.ManagementURL)
 	}
 }
 
@@ -231,16 +263,18 @@ func TestDisplayNameFallsBackFromNameToExitToHost(t *testing.T) {
 	if got := payload(t, "jetbox://connect#k="+key+"&e=node").DisplayName(); got != "node" {
 		t.Error(got)
 	}
-	if got := payload(t, "jetbox://connect#k="+key+"&m=https://mgmt.example.net").DisplayName(); got != "mgmt.example.net" {
+	if got := payload(t, "jetbox://connect#k="+key+"&m=https://mgmt.jet-net.net").DisplayName(); got != "mgmt.jet-net.net" {
 		t.Error(got)
 	}
 }
 
 func TestBoxIdentityDistinguishesBoxes(t *testing.T) {
-	a := payload(t, "jetbox://connect#k="+key+"&m=https://mgmt.example.net&e=one")
-	b := payload(t, "jetbox://connect#k="+key+"&m=https://mgmt.example.net&e=two")
-	sameAsA := payload(t, "jetbox://connect#k="+key+"&m=https://MGMT.example.net/&e=one&n=x")
-	if a.BoxIdentity() == b.BoxIdentity() || a.BoxIdentity() != sameAsA.BoxIdentity() {
+	a := payload(t, "jetbox://connect#k="+key+"&m=https://mgmt.jet-net.net&e=one")
+	b := payload(t, "jetbox://connect#k="+key+"&m=https://mgmt.jet-net.net&e=two")
+	sameAsA := payload(t, "jetbox://connect#k="+key+"&m=https://MGMT.jet-net.net/&e=one&n=x")
+	// Ссылка без n и с n той же коробки (свой e) — одно подключение (сравнение без n).
+	if a.BoxIdentity() == b.BoxIdentity() || !SameIdentity(a.IdentityFields(), sameAsA.IdentityFields()) ||
+		SameIdentity(a.IdentityFields(), b.IdentityFields()) {
 		t.Fatal(a.BoxIdentity(), b.BoxIdentity(), sameAsA.BoxIdentity())
 	}
 }
@@ -262,20 +296,71 @@ func TestBoxIdentityRules(t *testing.T) {
 	old := payload(t, "jetbox://connect#k="+key+"&m=https://NetBird.jet-net.net")
 	named := payload(t, "jetbox://connect#k="+key+"&m=https://NetBird.jet-net.net&n=Dom")
 
-	if got, want := cloud.BoxIdentity(), "netbird.jet-net.net|t:"+Fingerprint("dev-token-aaaa"); got != want {
-		t.Fatalf("облако: %q, want %q", got, want)
+	// t в удостоверение не входит: «Новая ссылка» того же абонента — то же удостоверение.
+	if got, want := cloud.BoxIdentity(), "netbird.jet-net.net|n:Иванов"; got != want {
+		t.Fatalf("облако без e: %q, want %q", got, want)
 	}
-	if strings.Contains(cloud.BoxIdentity(), "dev-token") {
-		t.Fatal("токен устройства в удостоверении целиком")
+	if strings.Contains(cloud.BoxIdentity(), "dev-token") || cloud.BoxIdentity() != otherCloud.BoxIdentity() {
+		t.Fatal("токен устройства в удостоверении")
 	}
-	if cloud.BoxIdentity() == otherCloud.BoxIdentity() {
-		t.Fatal("разные t — одно удостоверение")
-	}
-	if box.BoxIdentity() != "netbird.jet-net.net|box-ivanov" {
-		t.Fatalf("e важнее t: %q", box.BoxIdentity())
+	if box.BoxIdentity() != "netbird.jet-net.net|box-ivanov|Иванов" {
+		t.Fatalf("e и n: %q", box.BoxIdentity())
 	}
 	if old.BoxIdentity() != "netbird.jet-net.net|" || named.BoxIdentity() != "netbird.jet-net.net|n:Dom" {
 		t.Fatalf("старые ссылки: %q %q", old.BoxIdentity(), named.BoxIdentity())
+	}
+}
+
+// Общие векторы удостоверения (LINK-CONTRACT 1.3 §2.11, источник — iOS), раздел cases.
+// Раздел compare гоняет core/flow (SameConnection/sameBox).
+func TestBoxIdentityVectors(t *testing.T) {
+	raw, err := os.ReadFile("testdata/identity.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		Cases []struct{ Link, Identity, About string } `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.Cases) < 14 {
+		t.Fatalf("случаев %d — файл обрезан?", len(v.Cases))
+	}
+	for _, c := range v.Cases {
+		p := payload(t, c.Link)
+		if got := p.BoxIdentity(); got != c.Identity {
+			t.Errorf("%s: %q, want %q", c.About, got, c.Identity)
+		}
+		// Разбор строки обратно даёт те же части, что у ссылки.
+		if got, want := ParseIdentity(p.BoxIdentity()), p.IdentityFields(); got != want {
+			t.Errorf("%s: ParseIdentity %+v, want %+v", c.About, got, want)
+		}
+	}
+}
+
+func TestParseIdentityFormats(t *testing.T) {
+	cases := map[string]IdentityFields{
+		"h|sv-x|Офис":  {Host: "h", Exit: "sv-x", Name: "Офис", Known: true},
+		"h|sv-x|a|b":   {Host: "h", Exit: "sv-x", Name: "a|b", Known: true},
+		"h|sv-x|":      {Host: "h", Exit: "sv-x", Known: true},
+		"h|sv-x":       {Host: "h", Exit: "sv-x", Known: true}, // до 1.0.6
+		"h|n:Дом":      {Host: "h", Name: "Дом", Known: true},
+		"h|":           {Host: "h", Known: true},
+		"h|t:0123abcd": {Host: "h"}, // облако 1.0.5 — неизвестно
+		"":             {Known: true},
+	}
+	for id, want := range cases {
+		if got := ParseIdentity(id); got != want {
+			t.Errorf("%q: %+v, want %+v", id, got, want)
+		}
+	}
+	// Запись облака 1.0.5 ни с чем не совпадает — даже с той же ссылкой без e и n.
+	if SameIdentity(ParseIdentity("h|t:0123abcd"), ParseIdentity("h|")) {
+		t.Error("хост|t:… совпал")
+	}
+	if !SharedExit("cl-exit") || !SharedExit("cl-eu") || SharedExit("sv-demo-exit") {
+		t.Error("SharedExit")
 	}
 }
 
@@ -303,5 +388,21 @@ func TestNoDefaultExit(t *testing.T) {
 		if out != OK || p.NoDefaultExit != want {
 			t.Errorf("%s: %v %v", raw, out, p.NoDefaultExit)
 		}
+	}
+}
+
+// Одна завершающая точка FQDN срезается: в службу уходит адрес без неё, удостоверение
+// с точкой = без точки (находка Android).
+func TestManagementTrailingDot(t *testing.T) {
+	p := payload(t, "jetbox://connect#k="+key+"&m=https%3A%2F%2FNetBird.jet-net.net.%3A33073&e=sv-x&n=X")
+	if p.ManagementURL != "https://netbird.jet-net.net:33073" {
+		t.Fatalf("в службу: %q", p.ManagementURL)
+	}
+	if p.BoxIdentity() != "netbird.jet-net.net|sv-x|X" {
+		t.Fatalf("удостоверение: %q", p.BoxIdentity())
+	}
+	// Запись, сохранённая с точкой (до 1.0.6), — тот же хост.
+	if !SameIdentity(ParseIdentity("netbird.jet-net.net.|sv-x|X"), p.IdentityFields()) {
+		t.Fatal("удостоверение с точкой не совпало")
 	}
 }

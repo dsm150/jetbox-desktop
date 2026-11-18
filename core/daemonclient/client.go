@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os/user"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -58,6 +59,10 @@ var currentUser = func() (string, error) {
 	}
 	return u.Username, nil
 }
+
+// CurrentUser — пользователь ОС, на которого AddProfile заводит новый профиль (вызывающий).
+// Flow пишет его в replace.json до AddProfile: прервут до ответа — профиль ищут у него.
+func CurrentUser() (string, error) { return currentUser() }
 
 // handle — как назвать активный профиль в запросе: ID (служба ищет сначала точное
 // совпадение ID, и одинаковые имена не мешают), у старой службы без ID — имя.
@@ -220,20 +225,26 @@ func (c *Client) ActiveProfile(ctx context.Context) (id, username string, err er
 	return handle(prof), prof.GetUsername(), nil
 }
 
-// AddProfile заводит профиль службы с отображаемым именем name для пользователя
-// активного профиля; у default он пуст (служба так хранит default) — тогда для
-// текущего пользователя ОС, как `netbird profile add`: служба без пользователя
-// профиль не создаст. Служба создаёт его сразу с новым ключом WireGuard
-// (profilemanager.AddProfile → createProvisionedConfig) — это и есть новая личность.
+// AddProfile заводит профиль службы с отображаемым именем name для вызывающего —
+// текущего пользователя ОС, как `netbird profile add`. Если активный профиль его же
+// (без учёта регистра), берётся написание из активного: тот же каталог профилей.
+// Активный default (служба хранит его без пользователя) или профиль другого
+// пользователя — новый всё равно заводится на вызывающего: свой незарегистрированный
+// профиль служба (патч 0008) даёт удалить без прав, и откат замены работает.
+// Служба создаёт его сразу с новым ключом WireGuard (profilemanager.AddProfile →
+// createProvisionedConfig) — это и есть новая личность.
 // Возвращает ID нового профиля и пользователя, для которого он заведён.
 func (c *Client) AddProfile(ctx context.Context, name string) (id, username string, err error) {
 	prof, err := c.c.GetActiveProfile(ctx, &proto.GetActiveProfileRequest{})
 	if err != nil {
 		return "", "", err
 	}
-	username, err = userFor("", prof.GetUsername())
+	username, err = currentUser()
 	if err != nil {
-		return "", "", err
+		return "", "", fmt.Errorf("пользователь ОС: %w", err)
+	}
+	if active := prof.GetUsername(); active != "" && strings.EqualFold(active, username) {
+		username = active
 	}
 	resp, err := c.c.AddProfile(ctx, &proto.AddProfileRequest{ProfileName: name, Username: username})
 	if err != nil {

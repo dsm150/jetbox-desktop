@@ -896,3 +896,29 @@ func TestStatusTimeoutKeepsScreen(t *testing.T) {
 		t.Fatalf("сокета нет: экран %s", st.Screen)
 	}
 }
+
+// Ссылка с m вне маски — экран «не на сервер JetBox» до вопроса о замене; в службу не идём.
+func TestForeignManagementLinkBeforeSwitchQuestion(t *testing.T) {
+	e := &fakeEngine{box: flow.Box{Identity: "netbird.jet-net.net|old-exit", Name: "Старый"}, hasBox: true}
+	c, _ := newCtl(e, &fakeStatus{st: connected()})
+	c.OnLink(context.Background(), "jetbox://connect/#k="+key+"&m=https%3A%2F%2Fevil.example&e=sv-demo-exit&n=Demo")
+	st := c.State()
+	if st.Screen != ScreenError || st.ErrorKind != "LinkForeign" || st.CanRetry || len(e.calls) != 0 {
+		t.Fatalf("%+v %v", st, e.calls)
+	}
+	c.Connect(context.Background())
+	if len(e.calls) != 0 {
+		t.Fatalf("подключение по чужой ссылке: %v", e.calls)
+	}
+}
+
+// Отказ службы по правам — свой текст, без «Повторить».
+func TestNeedsAdminIsNotRetryable(t *testing.T) {
+	e := &fakeEngine{err: &flow.Error{Kind: flow.KindNeedsAdmin, Detail: "регистрация"}}
+	c, _ := newCtl(e, &fakeStatus{st: &proto.StatusResponse{Status: "NeedsLogin"}})
+	c.OnLink(context.Background(), demoLink)
+	c.Connect(context.Background())
+	if st := c.State(); st.Screen != ScreenError || st.ErrorKind != "NeedsAdmin" || st.CanRetry {
+		t.Fatalf("%+v", st)
+	}
+}

@@ -7,6 +7,11 @@ SRC=$DAEMON/upstream/netbird-${TAG#v}
 OUT=$REPO/build-out
 VERSION=${TAG#v}+jetbox.$JETBOX_N
 BRAND_PKG=github.com/netbirdio/netbird/client/jetboxbrand
+# Go — ровно версия из строки toolchain в go.mod репозитория (одна на приложение и службу; локально = CI).
+# Строка toolchain go1.26.10 из go.mod апстрима переменной GOTOOLCHAIN перекрывается.
+GOTOOLCHAIN=$(sed -n 's/^toolchain \(go[0-9.]*\)$/\1/p' "$REPO/go.mod")
+[ -n "$GOTOOLCHAIN" ] || { echo "в $REPO/go.mod нет строки toolchain goX.Y.Z" >&2; exit 1; }
+export GOTOOLCHAIN
 # GUID адаптера wintun службы JetBox (постоянный, uuid5).
 WINDOWS_GUID='{f062c963-bee2-512d-92aa-136b1984b0ae}'
 

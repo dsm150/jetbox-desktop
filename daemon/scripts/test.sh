@@ -29,6 +29,9 @@ run() {
   fi
 }
 
+step "0. нумерация патчей (patchnames.sh)"
+run patchnames sh "$DAEMON/scripts/test-patchnames.sh"
+
 step "1. патчи на чистый тег ${TAG}"
 T=$DAEMON/upstream/.test-tree
 if DEST=$T sh "$DAEMON/scripts/prepare.sh" --force >"$LOG/prepare.log" 2>&1; then
@@ -39,6 +42,12 @@ fi
 cd "$T"
 
 step "2. тесты патчей и затронутых пакетов"
+# Векторы маски management в патче 0008 — копия общих (core/jetboxlink); разойтись не должны.
+if cmp -s "$REPO/core/jetboxlink/testdata/mgmt-mask.json" "$T/client/server/testdata/jetbox-mgmt-mask.json"; then
+  echo "  векторы маски management — те же, что у приложения"
+else
+  bad "client/server/testdata/jetbox-mgmt-mask.json разошёлся с core/jetboxlink/testdata/mgmt-mask.json"
+fi
 # Пакет dns целиком не гоняем: его darwin-тесты пишут в scutil (DNS этого мака).
 run unit go test -count=1 ./client/internal/updater/... ./client/system/ ./client/jetboxbrand/ \
   ./client/internal/profilemanager/ ./client/internal/portforward/ ./client/mdm/ \
@@ -52,6 +61,8 @@ for os in darwin windows; do
     go test -count=1 -ldflags "$(ldflags "$os")" -run 'BuildValues|Jetbox' -v \
     ./client/jetboxbrand/ ./client/internal/dns/ ./client/iface/device/ ./client/internal/profilemanager/
   grep -q -- '--- PASS: TestBuildValues' "$LOG/x-$os.log" || bad "TestBuildValues не прошёл для $os"
+  # Маска management (0008) — значение сборки обязано быть и дойти (TestBuildValues сверяет значение).
+  brand_lines "$os" | grep -qx 'AllowedManagementSuffix=.jet-net.net' || bad "в brand.env нет AllowedManagementSuffix=.jet-net.net для $os"
   if [ "$os" = windows ]; then
     grep -q -- '--- PASS: TestJetboxWindowsGUIDFlag' "$LOG/x-$os.log" || bad "GUID адаптера не дошёл"
   fi

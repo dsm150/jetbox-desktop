@@ -11,10 +11,12 @@ WHAT=${1:-all}
 sh "$DAEMON/scripts/prepare.sh"
 cd "$SRC"
 
+# Воспроизводимость (локально = CI): -trimpath — без путей; -buildvcs=false — без метки коммита (дерево
+# daemon/upstream — свой git, хеши его коммитов зависят от времени prepare.sh); -buildid= — без id сборки.
 build() { # goos goarch out
   mkdir -p "$(dirname "$3")"
-  GOOS=$1 GOARCH=$2 CGO_ENABLED=0 go build -trimpath -tags load_wgnt_from_rsrc \
-    -ldflags "$(ldflags "$1")" -o "$3" ./client
+  GOOS=$1 GOARCH=$2 GOAMD64=v1 CGO_ENABLED=0 go build -trimpath -buildvcs=false -tags load_wgnt_from_rsrc \
+    -ldflags "$(ldflags "$1") -buildid=" -o "$3" ./client
   echo "  $3"
 }
 

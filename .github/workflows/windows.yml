@@ -26,7 +26,22 @@ jobs:
       run:
         shell: bash
     steps:
+      # Reproducible build: the runner's git converts text files to CRLF by default (LICENSE, NOTICE, frontend,
+      # manifests), so the same commit gave other bytes than a checkout on macOS. Keep files exactly as committed.
+      - name: Git line endings
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
       - uses: actions/checkout@v4
+
+      # Exactly the Go from the `toolchain` line of go.mod — the same one local builds use (GOTOOLCHAIN in
+      # app/build.sh and daemon/scripts/lib.sh).
+      - name: Go toolchain version
+        run: |
+          go_version=$(sed -n 's/^toolchain go\([0-9.]*\)$/\1/p' go.mod)
+          [ -n "$go_version" ] || { echo "no toolchain line in go.mod"; exit 1; }
+          echo "GO_TOOLCHAIN=$go_version" >> "$GITHUB_ENV"
 
       - name: Version
         run: |
@@ -47,25 +62,37 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_TOOLCHAIN }}
           cache-dependency-path: go.sum
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
+      - name: Check Go
+        run: go version | grep -F "go version go${GO_TOOLCHAIN} " || { go version; exit 1; }
 
+      # Frontend toolchain = the release build machine (app/build.sh records both in JetBox.exe.buildinfo).
+      # Node first: pnpm 11 needs Node 22.13+ and pnpm/action-setup does not install Node itself.
+      # The pnpm store is cached by pnpm/action-setup (setup-node's `cache: pnpm` would need pnpm before it).
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: pnpm
-          cache-dependency-path: app/frontend/pnpm-lock.yaml
+          node-version: 26.0.0
 
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.5.0
+          cache: true
+          cache_dependency_path: app/frontend/pnpm-lock.yaml
+
+      - name: Check Node and pnpm
+        run: |
+          [ "$(node -v)" = v26.0.0 ] || { echo "node $(node -v), want v26.0.0"; exit 1; }
+          [ "$(pnpm -v)" = 11.5.0 ] || { echo "pnpm $(pnpm -v), want 11.5.0"; exit 1; }
+
+      # Exactly NSIS 3.13, as on the Windows build machine (packaging/windows/build.sh checks the version):
+      # the runner image ships its own NSIS, other versions give other installer bytes.
       - name: NSIS
         run: |
-          if ! command -v makensis >/dev/null 2>&1; then
-            [ -x "/c/Program Files (x86)/NSIS/makensis.exe" ] || choco install nsis -y --no-progress
-            echo "/c/Program Files (x86)/NSIS" >> "$GITHUB_PATH"
-          fi
+          choco install nsis --version=3.13.0 -y --no-progress --force
+          echo "/c/Program Files (x86)/NSIS" >> "$GITHUB_PATH"
+          "/c/Program Files (x86)/NSIS/makensis.exe" -VERSION
 
       - name: Tests
         run: |
@@ -101,4 +128,5 @@ jobs:
             build-out/windows-amd64/jetboxd.exe
             build-out/windows-amd64/JetBox-Setup.exe
             build-out/windows-amd64/SHA256SUMS
+            build-out/windows-amd64/*.buildinfo
           if-no-files-found: error

@@ -1,0 +1,1012 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: JetBox build <build@jetbox.invalid>
+Date: Wed, 18 Nov 2026 16:37:12 +0300
+Subject: [PATCH] jetbox: management mask and privileged removal of foreign
+ profiles
+
+Changing the management URL (SetConfig, Login) to a host outside
+*<AllowedManagementSuffix> now requires a privileged caller, regardless of
+the SSH server state. The suffix is a build-time value in jetboxbrand; empty
+keeps the upstream behaviour.
+
+RemoveProfile of a profile that belongs to another OS user or has been
+registered, and Logout of a profile that is not active or belongs to another
+user, require a privileged caller. Registration is tracked per profile with
+<id>.registered (written on a successful login) and <id>.added (written by
+AddProfile); a profile without <id>.added predates the marks and is treated
+as registered.
+---
+ client/jetboxbrand/brand.go                   |   5 +
+ client/jetboxbrand/brand_test.go              |   6 +
+ client/server/jetbox_mgmt_mask.go             |  83 ++++++
+ client/server/jetbox_mgmt_mask_test.go        | 162 +++++++++++
+ client/server/jetbox_profile_gate.go          | 186 +++++++++++++
+ client/server/jetbox_profile_gate_test.go     | 259 ++++++++++++++++++
+ client/server/jetbox_profile_owner_unix.go    |  25 ++
+ client/server/jetbox_profile_owner_windows.go |  31 +++
+ client/server/server.go                       |  26 +-
+ client/server/ssh_gate.go                     |   5 +
+ client/server/testdata/jetbox-mgmt-mask.json  |  44 +++
+ 11 files changed, 831 insertions(+), 1 deletion(-)
+ create mode 100644 client/server/jetbox_mgmt_mask.go
+ create mode 100644 client/server/jetbox_mgmt_mask_test.go
+ create mode 100644 client/server/jetbox_profile_gate.go
+ create mode 100644 client/server/jetbox_profile_gate_test.go
+ create mode 100644 client/server/jetbox_profile_owner_unix.go
+ create mode 100644 client/server/jetbox_profile_owner_windows.go
+ create mode 100644 client/server/testdata/jetbox-mgmt-mask.json
+
+diff --git a/client/jetboxbrand/brand.go b/client/jetboxbrand/brand.go
+index 5b64fa2..a5e90ae 100644
+--- a/client/jetboxbrand/brand.go
++++ b/client/jetboxbrand/brand.go
+@@ -58,6 +58,11 @@ var (
+ 	// пишет и удаляет при остановке.
+ 	SSHClientConfigFile = "99-netbird.conf"
+ 
++	// AllowedManagementSuffix — смена management (SetConfig/Login) на хост вне *<суффикс>
++	// требует прав администратора (патч «management mask»). Суффикс — с ведущей точкой
++	// («.jet-net.net»): поддомены — да, сам домен — нет. Пусто — без ограничения, как апстрим.
++	AllowedManagementSuffix = ""
++
+ 	// DarwinLaunchdStdoutLog и DarwinLaunchdStderrLog — логи stdout/stderr службы под launchd,
+ 	// которые собирает отладочный пакет.
+ 	DarwinLaunchdStdoutLog = "/var/log/netbird.out.log"
+diff --git a/client/jetboxbrand/brand_test.go b/client/jetboxbrand/brand_test.go
+index f00de98..aaa2520 100644
+--- a/client/jetboxbrand/brand_test.go
++++ b/client/jetboxbrand/brand_test.go
+@@ -25,6 +25,9 @@ func current() map[string]string {
+ 		"MDMPlistPath":           MDMPlistPath,
+ 		"MDMRegistryPath":        MDMRegistryPath,
+ 		"SSHClientConfigFile":    SSHClientConfigFile,
++
++		"AllowedManagementSuffix": AllowedManagementSuffix,
++
+ 		"DarwinLaunchdStdoutLog": DarwinLaunchdStdoutLog,
+ 		"DarwinLaunchdStderrLog": DarwinLaunchdStderrLog,
+ 		"DefaultManagementURL":   DefaultManagementURL,
+@@ -60,6 +63,9 @@ func TestDefaultsAreUpstream(t *testing.T) {
+ 		"MDMPlistPath":           "/Library/Managed Preferences/io.netbird.client.plist",
+ 		"MDMRegistryPath":        `Software\Policies\NetBird`,
+ 		"SSHClientConfigFile":    "99-netbird.conf",
++
++		"AllowedManagementSuffix": "",
++
+ 		"DarwinLaunchdStdoutLog": "/var/log/netbird.out.log",
+ 		"DarwinLaunchdStderrLog": "/var/log/netbird.err.log",
+ 		"DefaultManagementURL":   "https://api.netbird.io:443",
+diff --git a/client/server/jetbox_mgmt_mask.go b/client/server/jetbox_mgmt_mask.go
+new file mode 100644
+index 0000000..12430ed
+--- /dev/null
++++ b/client/server/jetbox_mgmt_mask.go
+@@ -0,0 +1,83 @@
++package server
++
++import (
++	"context"
++	"net"
++	"net/url"
++	"strconv"
++	"strings"
++
++	"github.com/netbirdio/netbird/client/internal/ipcauth"
++	"github.com/netbirdio/netbird/client/internal/profilemanager"
++	"github.com/netbirdio/netbird/client/jetboxbrand"
++)
++
++// JetBox: служба работает от root/SYSTEM и применяет маршруты, выход и DNS, которые раздаёт
++// management, для всей системы. Перевести её на чужой management обычный пользователь не
++// должен (docs/SERVICE-SOCKET-ACCESS.md, вариант Б): адрес вне *<AllowedManagementSuffix>
++// принимается только от привилегированного вызывающего. Пустой суффикс — апстрим.
++
++// jetboxManagementSuffix — переменная ради тестов; в сборке — значение -X.
++var jetboxManagementSuffix = func() string { return jetboxbrand.AllowedManagementSuffix }
++
++// jetboxManagementAllowed — адрес management в маске. Правило одно на все платформы JetBox
++// (LINK-CONTRACT §2.3, эталон — core/jetboxlink.AllowedManagement, общие векторы —
++// testdata/jetbox-mgmt-mask.json): https; без логина, пути (кроме «/»), query и фрагмента;
++// хост — ASCII-имя, не IP, оканчивается на суффикс (сам домен без поддомена — нет);
++// регистр и завершающая точка не важны; порт — любой 1–65535.
++func jetboxManagementAllowed(raw, suffix string) bool {
++	if suffix == "" {
++		return true
++	}
++	u, err := url.Parse(raw)
++	if err != nil || u.Scheme != "https" || u.User != nil || u.Opaque != "" {
++		return false
++	}
++	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(raw, "#") {
++		return false
++	}
++	if u.Path != "" && u.Path != "/" {
++		return false
++	}
++	if strings.HasSuffix(u.Host, ":") { // «host:» — двоеточие без порта
++		return false
++	}
++	if p := u.Port(); p != "" {
++		n, err := strconv.Atoi(p)
++		if err != nil || n < 1 || n > 65535 {
++			return false
++		}
++	}
++	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
++	if host == "" || net.ParseIP(host) != nil {
++		return false
++	}
++	for _, r := range host {
++		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '.') {
++			return false
++		}
++	}
++	for _, label := range strings.Split(host, ".") {
++		if label == "" {
++			return false
++		}
++	}
++	suffix = strings.ToLower(suffix)
++	return strings.HasSuffix(host, suffix) && len(host) > len(suffix)
++}
++
++// jetboxRequirePrivilegeForForeignManagement — часть requirePrivilegeForConfigChange: смена
++// management на адрес вне маски — только с правами, независимо от SSH. Повтор сохранённого
++// адреса (его мог поставить администратор) сменой не считается.
++func jetboxRequirePrivilegeForForeignManagement(ctx context.Context, stored *profilemanager.Config, change privilegedConfigChange) error {
++	suffix := jetboxManagementSuffix()
++	if change.managementURL == "" || jetboxManagementAllowed(change.managementURL, suffix) {
++		return nil
++	}
++	if stored != nil && sameManagementURL(stored.ManagementURL, change.managementURL) {
++		return nil
++	}
++	return denyPrivileged(ctx,
++		"connecting to a management server outside *"+suffix,
++		strings.ReplaceAll(ipcauth.UpCommand("-m "+change.managementURL), "netbird ", "jetboxd "))
++}
+diff --git a/client/server/jetbox_mgmt_mask_test.go b/client/server/jetbox_mgmt_mask_test.go
+new file mode 100644
+index 0000000..dac1122
+--- /dev/null
++++ b/client/server/jetbox_mgmt_mask_test.go
+@@ -0,0 +1,162 @@
++package server
++
++import (
++	"context"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc/codes"
++	gstatus "google.golang.org/grpc/status"
++
++	"github.com/netbirdio/netbird/client/internal"
++	"github.com/netbirdio/netbird/client/internal/profilemanager"
++	"github.com/netbirdio/netbird/client/jetboxbrand"
++	"github.com/netbirdio/netbird/client/proto"
++)
++
++const jetboxTestSuffix = ".jet-net.net"
++
++// withManagementSuffix включает маску на время теста (в upstream-тестах суффикс пуст — апстрим).
++func withManagementSuffix(t *testing.T, suffix string) {
++	t.Helper()
++	prev := jetboxManagementSuffix
++	jetboxManagementSuffix = func() string { return suffix }
++	t.Cleanup(func() { jetboxManagementSuffix = prev })
++}
++
++// Общие векторы маски — копия core/jetboxlink/testdata/mgmt-mask.json репозитория JetBox
++// (daemon/scripts/test.sh сверяет, что копия не разошлась).
++func TestJetboxManagementMaskVectors(t *testing.T) {
++	raw, err := os.ReadFile(filepath.Join("testdata", "jetbox-mgmt-mask.json"))
++	require.NoError(t, err)
++	var v struct {
++		Suffix string `json:"suffix"`
++		Cases  []struct {
++			M   string `json:"m"`
++			OK  bool   `json:"ok"`
++			Why string `json:"why"`
++		} `json:"cases"`
++	}
++	require.NoError(t, json.Unmarshal(raw, &v))
++	require.Equal(t, jetboxTestSuffix, v.Suffix)
++	require.GreaterOrEqual(t, len(v.Cases), 30, "файл векторов обрезан?")
++	for _, c := range v.Cases {
++		if got := jetboxManagementAllowed(c.M, v.Suffix); got != c.OK {
++			t.Errorf("%q (%s): %v, ждали %v", c.M, c.Why, got, c.OK)
++		}
++	}
++	// Значение нового профиля в сборке JetBox — в маске.
++	require.True(t, jetboxManagementAllowed("https://netbird.jet-net.net:443", jetboxTestSuffix))
++}
++
++func TestJetboxManagementMaskEmptySuffixIsUpstream(t *testing.T) {
++	require.True(t, jetboxManagementAllowed("https://api.netbird.io:443", ""))
++	require.True(t, jetboxManagementAllowed("http://1.2.3.4", ""))
++	if os.Getenv("JETBOX_BRAND_EXPECT") == "" {
++		require.Empty(t, jetboxbrand.AllowedManagementSuffix, "без -X маски нет")
++	}
++}
++
++// Маска проверяется до правила «SSH включён» и независимо от него.
++func TestJetboxForeignManagementGate(t *testing.T) {
++	withManagementSuffix(t, jetboxTestSuffix)
++	ours := mustURL(t, "https://netbird.jet-net.net:443")
++	foreign := mustURL(t, "https://evil.example:443")
++	sshOff := &profilemanager.Config{ManagementURL: ours, ServerSSHAllowed: boolPtr(false)}
++	sshOn := &profilemanager.Config{ManagementURL: ours, ServerSSHAllowed: boolPtr(true)}
++
++	for name, stored := range map[string]*profilemanager.Config{"нет конфига": nil, "SSH выкл": sshOff, "SSH вкл": sshOn} {
++		t.Run(name, func(t *testing.T) {
++			err := requirePrivilegeForConfigChange(userCtx(), stored, privilegedConfigChange{managementURL: "https://evil.example"})
++			assertDenied(t, err)
++			require.Contains(t, gstatus.Convert(err).Message(), "outside *.jet-net.net")
++			assertAllowed(t, requirePrivilegeForConfigChange(rootCtx(), stored, privilegedConfigChange{managementURL: "https://evil.example"}))
++		})
++	}
++	// Без учётных данных канала — отказ (fail closed).
++	assertDenied(t, requirePrivilegeForConfigChange(noIdentityCtx(), sshOff, privilegedConfigChange{managementURL: "https://1.2.3.4"}))
++	// В маске — без прав (при выключенном SSH).
++	assertAllowed(t, requirePrivilegeForConfigChange(userCtx(), sshOff, privilegedConfigChange{managementURL: "https://box2.jet-net.net:33073"}))
++	assertAllowed(t, requirePrivilegeForConfigChange(userCtx(), nil, privilegedConfigChange{managementURL: "https://netbird.jet-net.net"}))
++	// Без смены management маска не мешает.
++	assertAllowed(t, requirePrivilegeForConfigChange(userCtx(), sshOff, privilegedConfigChange{}))
++	// Сохранённый чужой адрес (его поставил администратор) повторить можно, сменить на другой чужой — нет.
++	adminSet := &profilemanager.Config{ManagementURL: foreign, ServerSSHAllowed: boolPtr(false)}
++	assertAllowed(t, requirePrivilegeForConfigChange(userCtx(), adminSet, privilegedConfigChange{managementURL: "https://evil.example"}))
++	assertDenied(t, requirePrivilegeForConfigChange(userCtx(), adminSet, privilegedConfigChange{managementURL: "https://other.example"}))
++}
++
++func TestJetboxSetConfigForeignManagement(t *testing.T) {
++	withManagementSuffix(t, jetboxTestSuffix)
++	s, _, profName, username, cfgPath := setupServerWithProfile(t)
++	_, err := profilemanager.UpdateOrCreateConfig(profilemanager.ConfigInput{
++		ConfigPath:       cfgPath,
++		ManagementURL:    "https://netbird.jet-net.net:443",
++		ServerSSHAllowed: boolPtr(false),
++	})
++	require.NoError(t, err)
++	req := func(m string) *proto.SetConfigRequest {
++		return &proto.SetConfigRequest{ProfileName: profName, Username: username, ManagementUrl: m}
++	}
++	stored := func() string {
++		c, err := profilemanager.GetExistingConfig(cfgPath)
++		require.NoError(t, err)
++		return c.ManagementURL.String()
++	}
++
++	_, err = s.SetConfig(userCtx(), req("https://evil.example:443"))
++	assertDenied(t, err)
++	require.Equal(t, "https://netbird.jet-net.net:443", stored(), "отказ не должен менять профиль")
++
++	_, err = s.SetConfig(userCtx(), req("https://box2.jet-net.net:443"))
++	require.NoError(t, err)
++	require.Equal(t, "https://box2.jet-net.net:443", stored())
++
++	_, err = s.SetConfig(rootCtx(), req("https://evil.example:443"))
++	require.NoError(t, err, "администратор может всё")
++	require.Equal(t, "https://evil.example:443", stored())
++}
++
++func TestJetboxLoginForeignManagement(t *testing.T) {
++	withManagementSuffix(t, jetboxTestSuffix)
++	s, _, activeProfile, username, _ := setupServerWithProfile(t)
++	s.rootCtx = internal.CtxInitState(context.Background())
++
++	target := "jetbox-target"
++	targetPath := filepath.Join(profilemanager.DefaultConfigPathDir, target+".json")
++	_, err := profilemanager.UpdateOrCreateConfig(profilemanager.ConfigInput{
++		ConfigPath:       targetPath,
++		ManagementURL:    "https://netbird.jet-net.net:443",
++		ServerSSHAllowed: boolPtr(false),
++	})
++	require.NoError(t, err)
++
++	// Обычный пользователь: отказ до любых действий — профиль не переключён, адрес не тронут.
++	_, err = s.Login(userCtx(), &proto.LoginRequest{
++		ProfileName: &target, Username: &username, SetupKey: "key", ManagementUrl: unreachableManagementURL,
++	})
++	assertDenied(t, err)
++	active, err := s.profileManager.GetActiveProfileState()
++	require.NoError(t, err)
++	require.Equal(t, profilemanager.ID(activeProfile), active.ID)
++	c, err := profilemanager.GetExistingConfig(targetPath)
++	require.NoError(t, err)
++	require.Equal(t, "https://netbird.jet-net.net:443", c.ManagementURL.String())
++
++	// Администратор проходит проверку; дальше вход упирается в недоступный адрес — но не в права.
++	ctx, cancel := context.WithTimeout(rootCtx(), 3*time.Second)
++	t.Cleanup(cancel)
++	_, err = s.Login(ctx, &proto.LoginRequest{
++		ProfileName: &target, Username: &username, SetupKey: "key", ManagementUrl: unreachableManagementURL,
++	})
++	require.Error(t, err)
++	require.NotEqual(t, codes.PermissionDenied, gstatus.Code(err), "администратора не должна останавливать маска: %v", err)
++	c, err = profilemanager.GetExistingConfig(targetPath)
++	require.NoError(t, err)
++	require.True(t, strings.HasPrefix(c.ManagementURL.String(), "https://127.0.0.1:9"), "адрес администратора записан: %s", c.ManagementURL)
++}
+diff --git a/client/server/jetbox_profile_gate.go b/client/server/jetbox_profile_gate.go
+new file mode 100644
+index 0000000..ae04a42
+--- /dev/null
++++ b/client/server/jetbox_profile_gate.go
+@@ -0,0 +1,186 @@
++package server
++
++import (
++	"context"
++	"os"
++	"strings"
++
++	log "github.com/sirupsen/logrus"
++	"google.golang.org/grpc/codes"
++	gstatus "google.golang.org/grpc/status"
++
++	"github.com/netbirdio/netbird/client/internal/ipcauth"
++	"github.com/netbirdio/netbird/client/internal/profilemanager"
++)
++
++// JetBox: отвязать пир и удалить профиль, который не принадлежит вызывающему или уже
++// зарегистрирован и не активен, может только администратор (docs/SERVICE-SOCKET-ACCESS.md,
++// вариант Г). Так служебный профиль (или профиль другого пользователя ОС) не снять обычной
++// программой, а откат замены подключения в приложении — удаление своего нового профиля, вход
++// в который не удался, — работает без прав.
++//
++// «Свой» — пользователь профиля (Username запроса: по нему служба выбирает каталог профилей)
++// совпадает с вызывающим по учётным данным канала: Unix — имя по uid, Windows — ДОМЕН\имя по
++// SID; без учёта регистра. Профиль default — ничей: свой для всех (удалить его служба не даёт).
++//
++// «Зарегистрирован» — метки рядом с файлом профиля:
++//   - <id>.registered — успешный Login в этот профиль;
++//   - <id>.added — профиль заведён AddProfile службой, которая ведёт метки (с 1.0.6).
++// Профиль без <id>.added заведён раньше — о его регистрации ничего не известно, считаем
++// зарегистрированным (решение руководителя 18.11.2026: бережёт служебные профили 1.0.5).
++
++const (
++	jetboxRegisteredSuffix = ".registered"
++	jetboxAddedSuffix      = ".added"
++)
++
++// jetboxProfileGate — переменная ради upstream-тестов сервера (jetbox_profile_gate_test.go).
++var jetboxProfileGate = true
++
++// jetboxCallerName — имя пользователя ОС вызывающего; переменная ради тестов.
++var jetboxCallerName = jetboxCallerNameOS
++
++type jetboxProfileOp int
++
++const (
++	jetboxOpRemove jetboxProfileOp = iota
++	jetboxOpLogout
++)
++
++// jetboxProfileMark — путь метки рядом с файлом профиля (<каталог>/<id><suffix>).
++func jetboxProfileMark(cfgPath, suffix string) string {
++	if cfgPath == "" {
++		return ""
++	}
++	return strings.TrimSuffix(cfgPath, ".json") + suffix
++}
++
++func jetboxWriteProfileMark(cfgPath, suffix string) {
++	p := jetboxProfileMark(cfgPath, suffix)
++	if p == "" {
++		return
++	}
++	if err := os.WriteFile(p, []byte("1\n"), 0o600); err != nil {
++		log.Warnf("profile mark %s: %v", p, err)
++	}
++}
++
++func jetboxRemoveProfileMarks(cfgPath string) {
++	for _, suffix := range []string{jetboxRegisteredSuffix, jetboxAddedSuffix} {
++		if p := jetboxProfileMark(cfgPath, suffix); p != "" {
++			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
++				log.Warnf("remove profile mark %s: %v", p, err)
++			}
++		}
++	}
++}
++
++func jetboxMarkExists(cfgPath, suffix string) bool {
++	p := jetboxProfileMark(cfgPath, suffix)
++	if p == "" {
++		return false
++	}
++	_, err := os.Stat(p)
++	return err == nil
++}
++
++// jetboxProfileRegistered — была ли у профиля регистрация (см. выше); без меток — да.
++func jetboxProfileRegistered(cfgPath string) bool {
++	return jetboxMarkExists(cfgPath, jetboxRegisteredSuffix) || !jetboxMarkExists(cfgPath, jetboxAddedSuffix)
++}
++
++// jetboxMarkProfileAdded — AddProfile: профиль заведён этой службой, регистрации пока нет.
++func jetboxMarkProfileAdded(p *profilemanager.Profile) {
++	if p == nil || p.ID == profilemanager.DefaultProfileName {
++		return
++	}
++	jetboxWriteProfileMark(p.Path, jetboxAddedSuffix)
++}
++
++// jetboxMarkProfileRegistered — успешный вход в профиль active (у default признак — общий
++// jetbox-registered).
++func jetboxMarkProfileRegistered(active *profilemanager.ActiveProfileState) {
++	if active == nil || active.ID == profilemanager.DefaultProfileName {
++		return
++	}
++	cfgPath, err := active.FilePath()
++	if err != nil {
++		log.Warnf("profile mark: %v", err)
++		return
++	}
++	jetboxWriteProfileMark(cfgPath, jetboxRegisteredSuffix)
++}
++
++// jetboxCallerIsUser — вызывающий и есть пользователь ОС username. Без учётных данных
++// канала или имени — нет (fail closed: решит denyPrivileged).
++func jetboxCallerIsUser(ctx context.Context, username string) bool {
++	if username == "" {
++		return false
++	}
++	id, ok := ipcauth.CallerIdentity(ctx)
++	if !ok {
++		return false
++	}
++	name, err := jetboxCallerName(id)
++	if err != nil {
++		log.Debugf("caller name for %s: %v", id, err)
++		return false
++	}
++	return name != "" && strings.EqualFold(name, username)
++}
++
++// requirePrivilegeForForeignProfile — проверка прав для RemoveProfile и Logout с ProfileName.
++// username — пользователь профиля из запроса, active — профиль сейчас активен.
++//
++//   - RemoveProfile: свой незарегистрированный — без прав; чужой или зарегистрированный — только
++//     с правами (активный служба всё равно не удалит, но апстрим до отказа успел бы снять его пир
++//     с учёта);
++//   - Logout: свой активный — без прав (как `netbird logout`: «Забыть коробку»); неактивный или
++//     чужой — только с правами.
++func requirePrivilegeForForeignProfile(ctx context.Context, op jetboxProfileOp, profile *profilemanager.Profile, username string, active bool) error {
++	if !jetboxProfileGate || profile == nil {
++		return nil
++	}
++	isDefault := profile.ID == profilemanager.DefaultProfileName
++	own := isDefault || jetboxCallerIsUser(ctx, username)
++	name := profile.ID.String()
++
++	switch op {
++	case jetboxOpRemove:
++		if isDefault {
++			return nil // default не удаляется — отказ апстрима
++		}
++		cfgPath := profile.Path
++		if own && !jetboxProfileRegistered(cfgPath) {
++			return nil
++		}
++		action := "removing a registered profile"
++		if !own {
++			action = "removing another user's profile"
++		}
++		return denyPrivileged(ctx, action, ipcauth.ElevatedCommand("jetboxd profile remove "+name))
++	case jetboxOpLogout:
++		if own && active {
++			return nil
++		}
++		action := "deregistering a profile that is not active"
++		if !own {
++			action = "deregistering another user's profile"
++		}
++		return denyPrivileged(ctx, action, ipcauth.ElevatedCommand("jetboxd logout --profile "+name))
++	}
++	return nil
++}
++
++// jetboxRequirePrivilegeForActiveLogout — Logout без имени профиля отвязывает активный: та же
++// проверка, что у Logout с ProfileName активного профиля (пользователь — из состояния активного).
++func (s *Server) jetboxRequirePrivilegeForActiveLogout(ctx context.Context) error {
++	if !jetboxProfileGate {
++		return nil
++	}
++	active, err := s.profileManager.GetActiveProfileState()
++	if err != nil {
++		return gstatus.Errorf(codes.FailedPrecondition, "failed to get active profile state: %v", err)
++	}
++	return requirePrivilegeForForeignProfile(ctx, jetboxOpLogout, &profilemanager.Profile{ID: active.ID}, active.Username, true)
++}
+diff --git a/client/server/jetbox_profile_gate_test.go b/client/server/jetbox_profile_gate_test.go
+new file mode 100644
+index 0000000..171eb29
+--- /dev/null
++++ b/client/server/jetbox_profile_gate_test.go
+@@ -0,0 +1,259 @@
++package server
++
++import (
++	"context"
++	"os"
++	"os/user"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++	"google.golang.org/grpc/codes"
++	gstatus "google.golang.org/grpc/status"
++
++	"github.com/netbirdio/netbird/client/internal"
++	"github.com/netbirdio/netbird/client/internal/ipcauth"
++	"github.com/netbirdio/netbird/client/internal/profilemanager"
++	"github.com/netbirdio/netbird/client/proto"
++)
++
++// Upstream-тесты сервера не знают о проверке Г (вызывающий у них — выдуманный uid/SID без
++// имени); JetBox-тесты ниже включают её сами. Значение сборки запоминается до init.
++var builtProfileGate = jetboxProfileGate
++
++func init() { jetboxProfileGate = false }
++
++func TestJetboxProfileGateOnByDefault(t *testing.T) {
++	require.True(t, builtProfileGate, "в сборке JetBox проверка Г включена")
++}
++
++// withProfileGate включает проверку Г и называет обычного вызывающего userCtx() именем owner.
++func withProfileGate(t *testing.T, owner string) {
++	t.Helper()
++	prevGate, prevName := jetboxProfileGate, jetboxCallerName
++	jetboxProfileGate = true
++	jetboxCallerName = func(id ipcauth.Identity) (string, error) {
++		if id.SameUser(unprivilegedIdentity()) {
++			return owner, nil
++		}
++		return "someone-else-entirely", nil
++	}
++	t.Cleanup(func() { jetboxProfileGate, jetboxCallerName = prevGate, prevName })
++}
++
++// addInactiveProfile заводит профиль через AddProfile (как приложение при замене) — с меткой .added.
++func addInactiveProfile(t *testing.T, s *Server, username string) *profilemanager.Profile {
++	t.Helper()
++	resp, err := s.AddProfile(userCtx(), &proto.AddProfileRequest{ProfileName: "JetBox new", Username: username})
++	require.NoError(t, err)
++	p, err := s.profileManager.ResolveProfile(resp.GetId(), username)
++	require.NoError(t, err)
++	require.FileExists(t, jetboxProfileMark(p.Path, jetboxAddedSuffix))
++	// Ключ WG есть, а management недоступен: утечка мимо проверки упадёт быстро, без сети.
++	_, err = profilemanager.UpdateOrCreateConfig(profilemanager.ConfigInput{
++		ConfigPath:       p.Path,
++		ManagementURL:    unreachableManagementURL,
++		ServerSSHAllowed: boolPtr(false),
++	})
++	require.NoError(t, err)
++	return p
++}
++
++func removeCtx(t *testing.T, base context.Context) context.Context {
++	ctx, cancel := context.WithTimeout(base, 2*time.Second)
++	t.Cleanup(cancel)
++	return ctx
++}
++
++// Откат замены: свой новый профиль без регистрации приложение удаляет без прав.
++func TestJetboxRemoveOwnUnregisteredProfile(t *testing.T) {
++	s, _, _, username, _ := setupServerWithProfile(t)
++	withProfileGate(t, username)
++	p := addInactiveProfile(t, s, username)
++
++	_, err := s.RemoveProfile(removeCtx(t, userCtx()), &proto.RemoveProfileRequest{ProfileName: p.ID.String(), Username: username})
++	require.NoError(t, err)
++	require.NoFileExists(t, p.Path)
++	require.NoFileExists(t, jetboxProfileMark(p.Path, jetboxAddedSuffix), "метки удаляются вместе с профилем")
++}
++
++// Свой, но зарегистрированный и неактивный (остался после замены) — только с правами.
++func TestJetboxRemoveOwnRegisteredProfileNeedsPrivilege(t *testing.T) {
++	s, _, _, username, _ := setupServerWithProfile(t)
++	withProfileGate(t, username)
++	p := addInactiveProfile(t, s, username)
++	jetboxMarkProfileRegistered(&profilemanager.ActiveProfileState{ID: p.ID, Username: username})
++	require.FileExists(t, jetboxProfileMark(p.Path, jetboxRegisteredSuffix))
++
++	_, err := s.RemoveProfile(removeCtx(t, userCtx()), &proto.RemoveProfileRequest{ProfileName: p.ID.String(), Username: username})
++	assertDenied(t, err)
++	require.FileExists(t, p.Path, "отказ не трогает профиль")
++
++	// Администратор — можно (отвязка пира — best effort, адрес недоступен).
++	_, err = s.RemoveProfile(removeCtx(t, rootCtx()), &proto.RemoveProfileRequest{ProfileName: p.ID.String(), Username: username})
++	require.NoError(t, err)
++	require.NoFileExists(t, p.Path)
++	require.NoFileExists(t, jetboxProfileMark(p.Path, jetboxRegisteredSuffix))
++}
++
++// Профиль 1.0.5 (без меток) считается зарегистрированным.
++func TestJetboxRemoveLegacyProfileNeedsPrivilege(t *testing.T) {
++	s, _, _, username, _ := setupServerWithProfile(t)
++	withProfileGate(t, username)
++	legacy := "legacy-1-0-5"
++	path := filepath.Join(profilemanager.DefaultConfigPathDir, legacy+".json")
++	_, err := profilemanager.UpdateOrCreateConfig(profilemanager.ConfigInput{ConfigPath: path, ManagementURL: unreachableManagementURL})
++	require.NoError(t, err)
++
++	_, err = s.RemoveProfile(removeCtx(t, userCtx()), &proto.RemoveProfileRequest{ProfileName: legacy, Username: username})
++	assertDenied(t, err)
++	require.FileExists(t, path)
++}
++
++// Чужой профиль (пользователь в запросе — не вызывающий) — только с правами, даже без регистрации.
++func TestJetboxRemoveForeignProfileNeedsPrivilege(t *testing.T) {
++	s, _, _, username, _ := setupServerWithProfile(t)
++	withProfileGate(t, "another-user")
++	p := addInactiveProfile(t, s, username)
++
++	_, err := s.RemoveProfile(removeCtx(t, userCtx()), &proto.RemoveProfileRequest{ProfileName: p.ID.String(), Username: username})
++	assertDenied(t, err)
++	require.Contains(t, gstatus.Convert(err).Message(), "another user's profile")
++	require.FileExists(t, p.Path)
++
++	// Без учётных данных канала — тоже чужой (fail closed).
++	_, err = s.RemoveProfile(removeCtx(t, noIdentityCtx()), &proto.RemoveProfileRequest{ProfileName: p.ID.String(), Username: username})
++	assertDenied(t, err)
++
++	_, err = s.RemoveProfile(removeCtx(t, rootCtx()), &proto.RemoveProfileRequest{ProfileName: p.ID.String(), Username: username})
++	require.NoError(t, err)
++}
++
++// Имя пользователя сравнивается без учёта регистра (Windows: ДОМЕН\имя).
++func TestJetboxCallerIsUserCaseInsensitive(t *testing.T) {
++	withProfileGate(t, `PC\Alice`)
++	require.True(t, jetboxCallerIsUser(userCtx(), `pc\alice`))
++	require.False(t, jetboxCallerIsUser(userCtx(), `pc\bob`))
++	require.False(t, jetboxCallerIsUser(userCtx(), ""))
++	require.False(t, jetboxCallerIsUser(noIdentityCtx(), `pc\alice`))
++}
++
++// Успешный вход ставит метку профилю; default — нет (у него общий jetbox-registered).
++func TestJetboxProfileRegisteredMarks(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "abc.json")
++	require.True(t, jetboxProfileRegistered(path), "без меток — профиль до 1.0.6, считаем зарегистрированным")
++	jetboxWriteProfileMark(path, jetboxAddedSuffix)
++	require.False(t, jetboxProfileRegistered(path))
++	jetboxWriteProfileMark(path, jetboxRegisteredSuffix)
++	require.True(t, jetboxProfileRegistered(path))
++	jetboxRemoveProfileMarks(path)
++	entries, err := os.ReadDir(dir)
++	require.NoError(t, err)
++	require.Empty(t, entries)
++
++	jetboxMarkProfileRegistered(&profilemanager.ActiveProfileState{ID: profilemanager.DefaultProfileName})
++	jetboxMarkProfileAdded(&profilemanager.Profile{ID: profilemanager.DefaultProfileName, Path: path})
++	entries, err = os.ReadDir(dir)
++	require.NoError(t, err)
++	require.Empty(t, entries)
++}
++
++// Logout активного своего («Забыть коробку») — без прав, как раньше.
++func TestJetboxLogoutActiveOwnProfileAllowed(t *testing.T) {
++	s, _, activeProfile, username, cfgPath := setupServerWithProfile(t)
++	s.rootCtx = internal.CtxInitState(context.Background())
++	withProfileGate(t, username)
++	_, err := profilemanager.UpdateOrCreateConfig(profilemanager.ConfigInput{
++		ConfigPath:       cfgPath,
++		ManagementURL:    unreachableManagementURL,
++		ServerSSHAllowed: boolPtr(false),
++	})
++	require.NoError(t, err)
++
++	_, err = s.Logout(removeCtx(t, userCtx()), &proto.LogoutRequest{ProfileName: &activeProfile, Username: &username})
++	// Дальше проверки служба идёт отвязывать пир на недоступный адрес — это не отказ по правам.
++	require.Error(t, err)
++	require.NotEqual(t, codes.PermissionDenied, gstatus.Code(err), "свой активный — без прав: %v", err)
++}
++
++// Logout неактивного своего и чужого — только с правами.
++func TestJetboxLogoutInactiveOrForeignNeedsPrivilege(t *testing.T) {
++	s, _, _, username, _ := setupServerWithProfile(t)
++	s.rootCtx = internal.CtxInitState(context.Background())
++	withProfileGate(t, username)
++	p := addInactiveProfile(t, s, username)
++	id := p.ID.String()
++
++	_, err := s.Logout(removeCtx(t, userCtx()), &proto.LogoutRequest{ProfileName: &id, Username: &username})
++	assertDenied(t, err)
++	require.Contains(t, gstatus.Convert(err).Message(), "not active")
++
++	withProfileGate(t, "another-user")
++	_, err = s.Logout(removeCtx(t, userCtx()), &proto.LogoutRequest{ProfileName: &id, Username: &username})
++	assertDenied(t, err)
++
++	_, err = s.Logout(removeCtx(t, rootCtx()), &proto.LogoutRequest{ProfileName: &id, Username: &username})
++	require.Error(t, err, "адрес недоступен")
++	require.NotEqual(t, codes.PermissionDenied, gstatus.Code(err), "администратору можно: %v", err)
++}
++
++// Имя вызывающего — в той же форме, что user.Current().Username у приложения
++// (Unix — имя по uid, Windows — ДОМЕН\имя по SID).
++func TestJetboxCallerNameMatchesCurrentUser(t *testing.T) {
++	self, err := ipcauth.CurrentProcessIdentity()
++	require.NoError(t, err)
++	cur, err := user.Current()
++	require.NoError(t, err)
++	name, err := jetboxCallerNameOS(self)
++	require.NoError(t, err)
++	require.True(t, strings.EqualFold(cur.Username, name), "%q против %q", name, cur.Username)
++}
++
++// Logout без имени профиля отвязывает активный: SwitchProfile на чужой профиль и Logout{} —
++// только с правами. Свой активный и default (ничей) — без прав («Забыть коробку»).
++func TestJetboxLogoutActiveWithoutProfileName(t *testing.T) {
++	setup := func(t *testing.T, owner string, active profilemanager.ActiveProfileState) *Server {
++		s, _, _, _, cfgPath := setupServerWithProfile(t)
++		s.rootCtx = internal.CtxInitState(context.Background())
++		withProfileGate(t, owner)
++		path := cfgPath
++		if active.ID == profilemanager.DefaultProfileName {
++			path = profilemanager.DefaultConfigPath
++		}
++		_, err := profilemanager.UpdateOrCreateConfig(profilemanager.ConfigInput{
++			ConfigPath: path, ManagementURL: unreachableManagementURL, ServerSSHAllowed: boolPtr(false),
++		})
++		require.NoError(t, err)
++		require.NoError(t, s.profileManager.SetActiveProfileState(&active))
++		return s
++	}
++	notRefused := func(t *testing.T, err error) {
++		t.Helper()
++		// Дальше проверки служба идёт отвязывать пир на недоступный адрес — это не отказ по правам.
++		require.Error(t, err)
++		require.NotEqual(t, codes.PermissionDenied, gstatus.Code(err), "%v", err)
++	}
++
++	t.Run("чужой активный — только с правами", func(t *testing.T) {
++		s := setup(t, "eve", profilemanager.ActiveProfileState{ID: "test-profile-mdm", Username: "alice"})
++		_, err := s.Logout(removeCtx(t, userCtx()), &proto.LogoutRequest{})
++		assertDenied(t, err)
++		require.Contains(t, gstatus.Convert(err).Message(), "another user's profile")
++		require.Contains(t, gstatus.Convert(err).Message(), "jetboxd logout")
++		_, err = s.Logout(removeCtx(t, rootCtx()), &proto.LogoutRequest{})
++		notRefused(t, err)
++	})
++	t.Run("свой активный — без прав", func(t *testing.T) {
++		s := setup(t, "alice", profilemanager.ActiveProfileState{ID: "test-profile-mdm", Username: "ALICE"})
++		_, err := s.Logout(removeCtx(t, userCtx()), &proto.LogoutRequest{})
++		notRefused(t, err)
++	})
++	t.Run("default — ничей, без прав", func(t *testing.T) {
++		s := setup(t, "eve", profilemanager.ActiveProfileState{ID: profilemanager.DefaultProfileName})
++		_, err := s.Logout(removeCtx(t, userCtx()), &proto.LogoutRequest{})
++		notRefused(t, err)
++	})
++}
+diff --git a/client/server/jetbox_profile_owner_unix.go b/client/server/jetbox_profile_owner_unix.go
+new file mode 100644
+index 0000000..50e598c
+--- /dev/null
++++ b/client/server/jetbox_profile_owner_unix.go
+@@ -0,0 +1,25 @@
++//go:build !windows
++
++package server
++
++import (
++	"os/user"
++	"strconv"
++
++	"github.com/netbirdio/netbird/client/internal/ipcauth"
++)
++
++// jetboxCallerNameOS — имя пользователя по uid вызывающего, как его берёт приложение
++// (user.Current().Username). Без записи о пользователе — число uid: так же поступает
++// profilemanager.InvokingUser.
++func jetboxCallerNameOS(id ipcauth.Identity) (string, error) {
++	uid := strconv.FormatUint(uint64(id.UID), 10)
++	u, err := user.LookupId(uid)
++	if err != nil {
++		if _, unknown := err.(user.UnknownUserIdError); unknown {
++			return uid, nil
++		}
++		return "", err
++	}
++	return u.Username, nil
++}
+diff --git a/client/server/jetbox_profile_owner_windows.go b/client/server/jetbox_profile_owner_windows.go
+new file mode 100644
+index 0000000..b373a3b
+--- /dev/null
++++ b/client/server/jetbox_profile_owner_windows.go
+@@ -0,0 +1,31 @@
++//go:build windows
++
++package server
++
++import (
++	"fmt"
++
++	"golang.org/x/sys/windows"
++
++	"github.com/netbirdio/netbird/client/internal/ipcauth"
++)
++
++// jetboxCallerNameOS — ДОМЕН\имя по SID вызывающего (LookupAccountSid), в той же форме, что
++// user.Current().Username у приложения.
++func jetboxCallerNameOS(id ipcauth.Identity) (string, error) {
++	if id.SID == "" {
++		return "", fmt.Errorf("caller has no SID")
++	}
++	sid, err := windows.StringToSid(id.SID)
++	if err != nil {
++		return "", fmt.Errorf("parse SID %s: %w", id.SID, err)
++	}
++	account, domain, _, err := sid.LookupAccount("")
++	if err != nil {
++		return "", fmt.Errorf("lookup SID %s: %w", id.SID, err)
++	}
++	if domain == "" {
++		return account, nil
++	}
++	return domain + `\` + account, nil
++}
+diff --git a/client/server/server.go b/client/server/server.go
+index 6b522fb..3f26b56 100644
+--- a/client/server/server.go
++++ b/client/server/server.go
+@@ -795,6 +795,7 @@ func (s *Server) Login(callerCtx context.Context, msg *proto.LoginRequest) (*pro
+ 	}
+ 	if !needsLogin {
+ 		jetboxMarkRegistered()
++		jetboxMarkProfileRegistered(activeProf)
+ 		state.Set(internal.StatusIdle)
+ 		return &proto.LoginResponse{}, nil
+ 	}
+@@ -813,6 +814,7 @@ func (s *Server) Login(callerCtx context.Context, msg *proto.LoginRequest) (*pro
+ 		return nil, err
+ 	}
+ 	jetboxMarkRegistered()
++	jetboxMarkProfileRegistered(activeProf)
+ 
+ 	return &proto.LoginResponse{}, nil
+ }
+@@ -1129,6 +1131,9 @@ func (s *Server) WaitSSOLogin(callerCtx context.Context, msg *proto.WaitSSOLogin
+ 		return nil, err
+ 	}
+ 	jetboxMarkRegistered()
++	if activeProf, err := s.profileManager.GetActiveProfileState(); err == nil {
++		jetboxMarkProfileRegistered(activeProf)
++	}
+ 
+ 	log.Infof("SSO login flow finished, returning success to caller")
+ 	return &proto.WaitSSOLoginResponse{
+@@ -1589,7 +1594,13 @@ func (s *Server) handleProfileLogout(ctx context.Context, msg *proto.LogoutReque
+ 		return nil, gstatus.Errorf(codes.FailedPrecondition, "failed to get active profile state: %v", err)
+ 	}
+ 
+-	if err := s.validateProfileLogout(resolved.ID, isActiveProfile(activeProf, resolved.ID, username)); err != nil {
++	active := isActiveProfile(activeProf, resolved.ID, username)
++	if err := s.validateProfileLogout(resolved.ID, active); err != nil {
++		return nil, err
++	}
++
++	// JetBox: неактивный или чужой профиль — только с правами.
++	if err := requirePrivilegeForForeignProfile(ctx, jetboxOpLogout, resolved, username, active); err != nil {
+ 		return nil, err
+ 	}
+ 
+@@ -1636,6 +1647,12 @@ func (s *Server) cleanupAfterProfileLogout(id profilemanager.ID, username string
+ }
+ 
+ func (s *Server) handleActiveProfileLogout(ctx context.Context) (*proto.LogoutResponse, error) {
++	// JetBox: активный профиль чужого пользователя (SwitchProfile на него, затем Logout{}) —
++	// только с правами; default — ничей, свой для всех.
++	if err := s.jetboxRequirePrivilegeForActiveLogout(ctx); err != nil {
++		return nil, err
++	}
++
+ 	if s.config == nil {
+ 		activeProf, err := s.profileManager.GetActiveProfileState()
+ 		if err != nil {
+@@ -2538,6 +2555,7 @@ func (s *Server) AddProfile(ctx context.Context, msg *proto.AddProfileRequest) (
+ 		log.Errorf("failed to create profile: %v", err)
+ 		return nil, fmt.Errorf("failed to create profile: %w", err)
+ 	}
++	jetboxMarkProfileAdded(created)
+ 
+ 	s.publishProfileListChanged(msg.ProfileName)
+ 
+@@ -2590,6 +2608,11 @@ func (s *Server) RemoveProfile(ctx context.Context, msg *proto.RemoveProfileRequ
+ 		return nil, err
+ 	}
+ 
++	// JetBox: чужой или зарегистрированный профиль — только с правами.
++	if err := requirePrivilegeForForeignProfile(ctx, jetboxOpRemove, resolved, msg.Username, false); err != nil {
++		return nil, err
++	}
++
+ 	if err := s.logoutFromProfile(ctx, resolved, msg.Username); err != nil {
+ 		// Deregistration is best-effort here: the local profile is removed
+ 		// either way, so an unprivileged caller leaves the peer registered on
+@@ -2601,6 +2624,7 @@ func (s *Server) RemoveProfile(ctx context.Context, msg *proto.RemoveProfileRequ
+ 		log.Errorf("failed to remove profile: %v", err)
+ 		return nil, fmt.Errorf("failed to remove profile: %w", err)
+ 	}
++	jetboxRemoveProfileMarks(resolved.Path)
+ 
+ 	s.publishProfileListChanged(msg.ProfileName)
+ 
+diff --git a/client/server/ssh_gate.go b/client/server/ssh_gate.go
+index 40d66b7..e72d7c0 100644
+--- a/client/server/ssh_gate.go
++++ b/client/server/ssh_gate.go
+@@ -83,6 +83,11 @@ func privilegedChangeFromLogin(msg *proto.LoginRequest) privilegedConfigChange {
+ // value it does not change is never refused: a UI that submits the whole
+ // settings form must not start failing once an administrator has enabled SSH.
+ func requirePrivilegeForConfigChange(ctx context.Context, stored *profilemanager.Config, change privilegedConfigChange) error {
++	// JetBox: management вне маски — только с правами, до проверки SSH и независимо от неё.
++	if err := jetboxRequirePrivilegeForForeignManagement(ctx, stored, change); err != nil {
++		return err
++	}
++
+ 	if enables(storedFlag(stored, func(c *profilemanager.Config) *bool { return c.EnableSSHRoot }), change.enableSSHRoot) {
+ 		return denyPrivileged(ctx, "enabling SSH root login", ipcauth.UpCommand("--enable-ssh-root"))
+ 	}
+diff --git a/client/server/testdata/jetbox-mgmt-mask.json b/client/server/testdata/jetbox-mgmt-mask.json
+new file mode 100644
+index 0000000..e0dbc50
+--- /dev/null
++++ b/client/server/testdata/jetbox-mgmt-mask.json
+@@ -0,0 +1,44 @@
++{
++  "about": "Общие тест-векторы маски management (LINK-CONTRACT §2.3, план 1.0.6). m — значение параметра после percent-decoding. Правило: https; без логина, пути (кроме /), query и фрагмента; хост — ASCII-имя (не IP), в нижнем регистре без завершающей точки, оканчивается на .jet-net.net (сам jet-net.net — нет); порт 1–65535. Векторы проверяют саму маску; в разборе ссылки пустой или отсутствующий m по-прежнему означает management по умолчанию (https://netbird.jet-net.net, он в маске), маска применяется к заданному m. Обрезка пробелов по краям m до маски — на усмотрение разбора платформы (хост проверяется всё равно).",
++  "suffix": ".jet-net.net",
++  "cases": [
++    {"m": "https://netbird.jet-net.net", "ok": true, "why": "боевой management"},
++    {"m": "https://netbird.jet-net.net/", "ok": true, "why": "только слэш в пути"},
++    {"m": "https://netbird.jet-net.net:443", "ok": true, "why": "порт явно (так пишет служба)"},
++    {"m": "https://netbird.jet-net.net:33073", "ok": true, "why": "нестандартный порт"},
++    {"m": "https://NETBIRD.Jet-Net.NET", "ok": true, "why": "регистр не важен"},
++    {"m": "https://netbird.jet-net.net.", "ok": true, "why": "завершающая точка FQDN"},
++    {"m": "https://a.b.jet-net.net", "ok": true, "why": "поддомен второго уровня"},
++    {"m": "https://xn--80aswg.jet-net.net", "ok": true, "why": "punycode-поддомен внутри маски"},
++    {"m": "https://jet-net.net", "ok": false, "why": "сам домен без поддомена — нет"},
++    {"m": "https://evil-jet-net.net", "ok": false, "why": "суффикс без точки"},
++    {"m": "https://jet-net.net.evil.com", "ok": false, "why": "наш домен в начале чужого"},
++    {"m": "https://netbird.jet-net.net.evil.com", "ok": false, "why": "наш хост в начале чужого"},
++    {"m": "https://netbirdjet-net.net", "ok": false, "why": "склеено без точки"},
++    {"m": "http://netbird.jet-net.net", "ok": false, "why": "не https"},
++    {"m": "netbird.jet-net.net", "ok": false, "why": "без схемы"},
++    {"m": "", "ok": false, "why": "пусто"},
++    {"m": "https://1.2.3.4", "ok": false, "why": "IPv4"},
++    {"m": "https://100.64.0.1:33073", "ok": false, "why": "IP из CGNAT (100.64.0.0/10)"},
++    {"m": "https://[::1]", "ok": false, "why": "IPv6"},
++    {"m": "https://2130706433", "ok": false, "why": "десятичный IP"},
++    {"m": "https://user@netbird.jet-net.net", "ok": false, "why": "логин в адресе"},
++    {"m": "https://user:pass@netbird.jet-net.net", "ok": false, "why": "логин и пароль в адресе"},
++    {"m": "https://evil.com@netbird.jet-net.net", "ok": false, "why": "логин похож на хост"},
++    {"m": "https://netbird.jet-net.net@evil.com", "ok": false, "why": "наш хост в логине"},
++    {"m": "https://netbird.jet-net.net/api", "ok": false, "why": "путь"},
++    {"m": "https://netbird.jet-net.net?x=1", "ok": false, "why": "query"},
++    {"m": "https://netbird.jet-net.net#x", "ok": false, "why": "фрагмент"},
++    {"m": "https://netbird.jet-net.net:0", "ok": false, "why": "порт 0"},
++    {"m": "https://netbird.jet-net.net:99999", "ok": false, "why": "порт вне диапазона"},
++    {"m": "https://netbird.jet-net.net:", "ok": false, "why": "двоеточие без порта (находка Android)"},
++    {"m": "https://.jet-net.net", "ok": false, "why": "пустой поддомен"},
++    {"m": "https://netbird..jet-net.net", "ok": false, "why": "пустая метка"},
++    {"m": "https://netbird.jet-net.net..", "ok": false, "why": "две завершающие точки — срезается одна (находка Android)"},
++    {"m": "https://jet-net.net.", "ok": false, "why": "сам домен с завершающей точкой — нет (находка Android)"},
++    {"m": " https://netbird.jet-net.net", "ok": false, "why": "пробел в начале (не обрезаем)"},
++    {"m": "https://netbird.jet-net.net\\@evil.com", "ok": false, "why": "обратный слэш"},
++    {"m": "https://нетберд.jet-net.net", "ok": false, "why": "не ASCII (только punycode)"},
++    {"m": "https://netbird.jet-net.net%2Eevil.com", "ok": false, "why": "закодированная точка в хосте"}
++  ]
++}

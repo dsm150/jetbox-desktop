@@ -75,6 +75,8 @@ func report(what string, err error) bool {
 		say("Включён другой VPN: %s. Выключите его или запустите снова с --ignore-other-vpn", detailOf(err))
 	case flow.KindNeedsLink:
 		say("Нужна ссылка подключения: jetbox-connect --link-file <путь>")
+	case flow.KindNeedsAdmin:
+		say("Это действие требует прав администратора")
 	}
 	return true
 }
@@ -141,6 +143,10 @@ func main() {
 			os.Exit(2)
 		}
 		link, out := jetboxlink.Parse(strings.TrimSpace(string(raw)))
+		if out == jetboxlink.Foreign {
+			say("Ссылка ведёт не на сервер JetBox. Запросите ссылку подключения в личном кабинете")
+			os.Exit(2)
+		}
 		if out != jetboxlink.OK {
 			say("Ссылка повреждена. Запросите новую ссылку подключения")
 			os.Exit(2)

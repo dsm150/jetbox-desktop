@@ -37,12 +37,15 @@ type Box struct {
 // Пишется перед AddProfile, удаляется после сохранения коробки или после отката:
 // осталась — замену прервали (выход, сбой питания), и Flow доводит откат.
 type Replace struct {
-	OldID   string    `json:"old_id"`             // профиль, активный до замены
-	OldUser string    `json:"old_user,omitempty"` // его пользователь
-	NewName string    `json:"new_name"`           // имя нового профиля (jetbox-<unixtime>)
-	NewID   string    `json:"new_id,omitempty"`   // ID нового, когда служба его назвала
-	NewUser string    `json:"new_user,omitempty"` // пользователь нового
-	At      time.Time `json:"at"`
+	OldID   string `json:"old_id"`             // профиль, активный до замены
+	OldUser string `json:"old_user,omitempty"` // его пользователь
+	NewName string `json:"new_name"`           // имя нового профиля (jetbox-<unixtime>)
+	NewID   string `json:"new_id,omitempty"`   // ID нового, когда служба его назвала
+	NewUser string `json:"new_user,omitempty"` // пользователь нового
+	// WasOn — защита была включена до замены: откат (и сверка, доводящая его) поднимает
+	// прежнее подключение. Нет в файле (1.0.5) — не поднимать.
+	WasOn bool      `json:"was_on,omitempty"`
+	At    time.Time `json:"at"`
 }
 
 // Store хранит Box в JSON-файле в каталоге настроек приложения (и Replace рядом).
@@ -52,6 +55,8 @@ type Replace struct {
 type Store struct {
 	mu   sync.RWMutex
 	path string
+	// saveErr — только для тестов: Save отвечает этой ошибкой (сбой записи box.json).
+	saveErr error
 }
 
 // NewStore — хранилище по пути к файлу (каталоги создаются при записи).
@@ -82,6 +87,9 @@ func (s *Store) Load() (Box, bool, error) {
 func (s *Store) Save(b Box) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.saveErr != nil {
+		return s.saveErr
+	}
 	return writeJSON(s.path, b)
 }
 
