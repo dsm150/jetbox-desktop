@@ -17,6 +17,12 @@ jb_unload() {
   return 0
 }
 
+# jb_disabled <домен> <метка> — задание выключено в этом домене (launchctl disable; так человек
+# выключает «Запускать JetBox при входе»). macOS 13+ пишет «=> disabled», старые — «=> true».
+jb_disabled() {
+  launchctl print-disabled "$1" 2>/dev/null | grep -Eq "\"$2\" => (disabled|true)"
+}
+
 # jb_load <домен> <метка> <plist> — загрузить; при сбое повторить; если задание уже загружено —
 # перезапустить его. Код 0 — задание загружено и запущено.
 jb_load() {

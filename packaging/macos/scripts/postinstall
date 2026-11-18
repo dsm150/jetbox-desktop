@@ -34,7 +34,13 @@ mkdir -p /var/log/jetbox
     *)
       uid=$(id -u "$user")
       if [ -f "$AGENT_PLIST" ]; then
-        jb_load "gui/$uid" "$AGENT" "$AGENT_PLIST" || echo "автозапуск для $user не поднялся (поднимется при входе)"
+        if jb_disabled "gui/$uid" "$AGENT"; then
+          # Человек выключил «Запускать JetBox при входе» (launchctl disable): не включаем снова
+          # (jb_load делает enable).
+          echo "автозапуск у $user выключен — не трогаем"
+        else
+          jb_load "gui/$uid" "$AGENT" "$AGENT_PLIST" || echo "автозапуск для $user не поднялся (поднимется при входе)"
+        fi
         # Окно после установки: второй запуск отдаётся первому экземпляру (SingleInstance).
         launchctl asuser "$uid" sudo -u "$user" open "$APP" || true
       fi ;;

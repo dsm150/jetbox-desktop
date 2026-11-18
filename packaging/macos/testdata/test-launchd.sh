@@ -35,6 +35,7 @@ case "$1" in
     touch "$S.loaded"; exit 0 ;;
   kickstart) [ -f "$S.loaded" ] && { echo kicked >> "$S.calls"; exit 0; }; exit 113 ;;
   enable) exit 0 ;;
+  print-disabled) [ -f "$S.disabled" ] && cat "$S.disabled"; exit 0 ;;
 esac
 exit 0
 FAKE
@@ -61,6 +62,19 @@ run_case "задание не выгружается — kickstart -k" \
   'touch "$T/state.loaded" "$T/state.sticky"; export FAKE_LINGER=0' ok "уже было загружено — перезапущено"
 run_case "чистая установка" \
   'export FAKE_LINGER=0' ok "загружено system/net.jet-net.jetbox.daemon (попытка 1)"
+
+# jb_disabled: выключенный человеком автозапуск видно в обоих форматах print-disabled.
+dis() { # имя, содержимое print-disabled, ожидаемое: yes|no
+  rm -f "$T"/state.*; export FAKE_STATE="$T/state"
+  [ -n "$2" ] && printf '%s\n' "$2" > "$T/state.disabled"
+  if PATH="$T/bin:$PATH" sh -c ". '$HERE/scripts/launchd.sh'; jb_disabled gui/501 net.jet-net.jetbox.desktop"; then got=yes; else got=no; fi
+  if [ "$got" = "$3" ]; then echo "  ✓ $1"; else echo "  ✗ $1 — получили $got"; FAIL=1; fi
+}
+dis "автозапуск выключен (macOS 13+: => disabled)" '	"net.jet-net.jetbox.desktop" => disabled' yes
+dis "автозапуск выключен (старый формат: => true)" '	"net.jet-net.jetbox.desktop" => true' yes
+dis "автозапуск включён (=> enabled)" '	"net.jet-net.jetbox.desktop" => enabled' no
+dis "метки нет в списке" '	"com.docker.helper" => disabled' no
+dis "пустой список" '' no
 
 # Регрессия: старый порядок (bootout → сразу bootstrap) на асинхронном bootout должен падать —
 # значит, тест действительно воспроизводит сбой 0.0.2 → 0.0.3.

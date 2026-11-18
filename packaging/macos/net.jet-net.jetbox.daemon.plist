@@ -26,7 +26,6 @@
 		<string>unix:///var/run/jetbox.sock</string>
 		<string>--log-file</string>
 		<string>/var/log/jetbox/client.log</string>
-		<string>--disable-profiles</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
