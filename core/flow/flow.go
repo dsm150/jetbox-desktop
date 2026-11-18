@@ -483,12 +483,27 @@ func (f *Flow) removeNew(ctx context.Context, j Replace, keep ...string) (remove
 		case err == nil:
 			removed = true
 		case status.Code(err) == codes.NotFound:
+		case f.profileGone(ctx, id, user):
+			// RemoveProfile ждёт management, чтобы снять пир, и при отмене удаляет профиль
+			// локально (server.go RemoveProfile): тайм-аут ещё не значит, что профиль остался.
+			removed = true
 		default:
 			f.logf("замена: удалить профиль %s: %v", id, err)
 			gone = false
 		}
 	}
 	return removed, gone
+}
+
+// profileGone — профиля id у службы больше нет (переспрос после неудачного RemoveProfile).
+func (f *Flow) profileGone(ctx context.Context, id, user string) bool {
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), removeTimeout)
+	defer cancel()
+	list, err := f.d.ListProfiles(lctx, user)
+	if err != nil {
+		return false
+	}
+	return !slices.ContainsFunc(list, func(p daemonclient.Profile) bool { return p.ID == id })
 }
 
 // Тайм-ауты отката: Down/SwitchProfile, Up прежнего, удаление нового профиля.
@@ -664,6 +679,14 @@ func (f *Flow) finish(ctx context.Context, link jetboxlink.Payload, stored Box, 
 		return Result{}, f.upError(ctx, err, KindLinkExpired)
 	}
 	f.syncAutoConnect(ctx, true)
+
+	if link.NoDefaultExit && !keepChoice {
+		// LINK-CONTRACT 1.2 §2.10: x=0 — выход не включать и не выбирать (облако:
+		// выход заводится с skip_auto_apply и выбирается позже, в окне).
+		f.rememberNoExit()
+		progress(StageProtected)
+		return Result{NoExit: true}, nil
+	}
 
 	progress(StageChoosingExit)
 	res, err := f.pickExit(ctx, link.ExitNode, saved)

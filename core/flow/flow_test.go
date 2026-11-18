@@ -57,6 +57,7 @@ type fakeDaemon struct {
 	activeErr    error             // ответ ActiveProfile
 	listErr      error             // ответ ListProfiles
 	removeErr    error             // ответ RemoveProfile (для существующего профиля)
+	removeLocal  bool              // RemoveProfile с removeErr всё же удалил профиль (тайм-аут management)
 	// strict — статусы как у службы: отказ Login → LoginFailed, вход и Down → Idle,
 	// Up в LoginFailed — «up already in progress» (server.go:770-799, 1197), удачный Up → Connected.
 	strict       bool
@@ -180,6 +181,9 @@ func (f *fakeDaemon) RemoveProfile(_ context.Context, id, _ string) error {
 	for i, p := range f.profiles {
 		if p == id {
 			if f.removeErr != nil {
+				if f.removeLocal {
+					f.profiles = append(f.profiles[:i], f.profiles[i+1:]...)
+				}
 				return f.removeErr
 			}
 			f.profiles = append(f.profiles[:i], f.profiles[i+1:]...)

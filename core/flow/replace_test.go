@@ -690,3 +690,47 @@ func TestRecoverServiceDownIsServiceMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Откат при недоступном management: RemoveProfile служба не дождалась (тайм-аут), но профиль
+// удалила локально — переспрос ListProfiles показывает, что его нет, запись стирается сразу.
+func TestRollbackRemoveTimeoutButDeletedLocally(t *testing.T) {
+	d := &fakeDaemon{status: "Connected", nets: demoNets, removeErr: status.Error(codes.DeadlineExceeded, "context deadline exceeded"),
+		removeLocal: true, loginErr: status.Error(codes.PermissionDenied, "invalid setup key")}
+	f, s := newFlow(t, d)
+	_ = s.Save(registeredBox(t, demoLink))
+	if _, err := f.Connect(context.Background(), link(t, reissuedDemoLink), Options{ConfirmSwitch: true}, nil); KindOf(err) != KindLinkExpired {
+		t.Fatal(err)
+	}
+	if _, ok := s.LoadReplace(); ok || len(d.profiles) != 0 {
+		t.Fatalf("профиль удалён службой — запись должна быть стёрта: profiles %v", d.profiles)
+	}
+}
+
+// LINK-CONTRACT 1.2 §2.10: облачная ссылка с x=0 — выход не выбирается и не включается.
+func TestCloudLinkNoDefaultExit(t *testing.T) {
+	d := &fakeDaemon{status: "NeedsLogin", nets: demoNets}
+	f, s := newFlow(t, d)
+	l := link(t, cloudA+"&e=cl-exit&x=0")
+	if !l.NoDefaultExit {
+		t.Fatal("x=0 не разобран")
+	}
+	res, err := f.Connect(context.Background(), l, Options{}, nil)
+	if err != nil || !res.NoExit || res.NeedsChoice {
+		t.Fatal(res, err)
+	}
+	if hasCall(d.calls, "SelectExit") || hasCall(d.calls, "DeselectExit") {
+		t.Fatalf("выход тронут: %v", d.calls)
+	}
+	if b, _, _ := s.Load(); !b.NoExit || b.ExitNode != "" {
+		t.Fatalf("box %+v", b)
+	}
+	// Повтор своей ссылки уважает выбор человека, а не x=0.
+	_ = s.Save(func() Box { b, _, _ := s.Load(); b.NoExit, b.ExitNode = false, "cl-exit"; return b }())
+	d.calls = nil
+	if _, err := f.Connect(context.Background(), l, Options{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !hasCall(d.calls, "SelectExit") {
+		t.Fatalf("своя ссылка — выход по сохранённому выбору: %v", d.calls)
+	}
+}

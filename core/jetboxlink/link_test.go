@@ -295,3 +295,13 @@ func TestKeyFingerprint(t *testing.T) {
 		t.Fatal(fp)
 	}
 }
+
+func TestNoDefaultExit(t *testing.T) {
+	base := "jetbox://connect#k=1EF79C2F-1A34-4B21-9C0D-1BF529332998&m=https%3A%2F%2Fnetbird.jet-net.net&t=tok"
+	for raw, want := range map[string]bool{base + "&x=0": true, base + "&X=0": true, base + "&x=1": false, base: false} {
+		p, out := Parse(raw)
+		if out != OK || p.NoDefaultExit != want {
+			t.Errorf("%s: %v %v", raw, out, p.NoDefaultExit)
+		}
+	}
+}

@@ -43,6 +43,9 @@ type Payload struct {
 	// Platform — кабинетный параметр `p` («что подключаем», например windows).
 	// На поведение приложения не влияет (LINK-CONTRACT §2.8).
 	Platform string
+	// NoDefaultExit — `x=0` (LINK-CONTRACT 1.2 §2.10): после подключения выход не включать
+	// и не выбирать; любое другое значение или отсутствие — обычный выбор выхода (§4.3).
+	NoDefaultExit bool
 }
 
 // Outcome — исход разбора.
@@ -158,6 +161,7 @@ func Parse(raw string) (Payload, Outcome) {
 		BoxName:       params["n"],
 		DeviceToken:   params["t"],
 		Platform:      params["p"],
+		NoDefaultExit: params["x"] == "0",
 	}, OK
 }
 
