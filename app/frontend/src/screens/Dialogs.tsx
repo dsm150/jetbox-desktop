@@ -4,6 +4,8 @@ import { has, t } from "../i18n";
 import type { State } from "../types";
 
 export function SwitchBox({ s }: { s: State }) {
+  // Другая коробка или абонент — «прежнее подключение будет заменено». Новая ссылка той же
+  // коробки (то же удостоверение) подключается без вопроса (LINK-CONTRACT 1.2 §2.11).
   return (
     <div className="screen">
       <h1>{t(s.lang, "switch.title")}</h1>
@@ -13,7 +15,9 @@ export function SwitchBox({ s }: { s: State }) {
           : t(s.lang, "switch.messageUnknown", s.linkBoxName)}
       </p>
       <div className="spacer" />
-      <button className="primary" disabled={s.busy} onClick={() => send("confirmSwitch")}>{t(s.lang, "switch.confirm")}</button>
+      <button className="primary" disabled={s.busy} onClick={() => send("confirmSwitch")}>
+        {t(s.lang, "switch.confirm")}
+      </button>
       <button className="secondary" onClick={() => send("cancelSwitch")}>{t(s.lang, "common.cancel")}</button>
     </div>
   );

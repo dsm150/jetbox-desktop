@@ -230,16 +230,16 @@ func TestForgetDisablesAutoConnect(t *testing.T) {
 	}
 }
 
-// Смена коробки: старую опустили — флаг ставится; новая включена — снова по галочке.
-func TestSwitchDisablesThenRestoresAutoConnect(t *testing.T) {
+// Замена подключения: флаг прежнего профиля не трогаем (активным он больше не будет),
+// новый профиль включён — флаг по галочке.
+func TestReplaceSetsAutoConnectInNewProfile(t *testing.T) {
 	d := &fakeDaemon{status: "Connected", nets: demoNets, traceAC: true}
 	f, s := newFlow(t, d)
 	_ = s.Save(Box{Identity: "old.example.com|x", ManagementURL: "https://old.example.com", AutoConnect: true})
 	if _, err := f.Connect(context.Background(), link(t, demoLink), Options{ConfirmSwitch: true}, nil); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"Status", "Down", "DisableAutoConnect true", "Logout", "Configure https://netbird.jet-net.net JetBox",
-		"Login https://netbird.jet-net.net", "Up", "DisableAutoConnect false", "SelectExit sv-demo-exit"}
+	want := []string{"Status", "Down", "AddProfile", "ConfigureProfile new1 https://netbird.jet-net.net JetBox", "LoginProfile new1 https://netbird.jet-net.net", "SwitchProfile new1", "Up", "DisableAutoConnect false", "SelectExit sv-demo-exit"}
 	if !reflect.DeepEqual(d.calls, want) {
 		t.Fatalf("calls %v", d.calls)
 	}

@@ -47,6 +47,23 @@ type fakeDaemon struct {
 	ac            []bool                          // значения SetDisableAutoConnect по порядку
 	acErr         error                           // ответ SetDisableAutoConnect
 	traceAC       bool                            // писать SetDisableAutoConnect и в calls
+
+	// Профили службы. Активный — active ("" — default), user — его пользователь.
+	active, user string
+	profiles     []string          // заведённые AddProfile и ещё не удалённые
+	names        map[string]string // имя профиля по ID
+	addErr       error             // ответ AddProfile
+	addCreates   bool              // AddProfile с addErr всё же создал профиль (отмена после создания)
+	activeErr    error             // ответ ActiveProfile
+	listErr      error             // ответ ListProfiles
+	removeErr    error             // ответ RemoveProfile (для существующего профиля)
+	// strict — статусы как у службы: отказ Login → LoginFailed, вход и Down → Idle,
+	// Up в LoginFailed — «up already in progress» (server.go:770-799, 1197), удачный Up → Connected.
+	strict       bool
+	switchErr    map[string]error                // ответ SwitchProfile по ID профиля
+	configureErr error                           // ответ Configure
+	loginHook    func(ctx context.Context) error // если задан — вместо loginErr
+	configured   []string                        // в какие профили писал Configure/ConfigureProfile
 }
 
 func (f *fakeDaemon) Status(context.Context) (*proto.StatusResponse, error) {
@@ -66,23 +83,131 @@ func (f *fakeDaemon) Status(context.Context) (*proto.StatusResponse, error) {
 }
 func (f *fakeDaemon) Configure(_ context.Context, mgmt, iface string, port int64) error {
 	f.calls = append(f.calls, "Configure "+mgmt+" "+iface)
+	if f.configureErr == nil {
+		f.configured = append(f.configured, f.activeID())
+	}
+	return f.configureErr
+}
+func (f *fakeDaemon) ConfigureProfile(_ context.Context, id, _, mgmt, iface string, port int64) error {
+	f.calls = append(f.calls, "ConfigureProfile "+id+" "+mgmt+" "+iface)
+	if f.configureErr == nil {
+		f.configured = append(f.configured, id)
+	}
+	return f.configureErr
+}
+
+// LoginProfile — как служба: профиль становится активным до входа и остаётся им при отказе.
+func (f *fakeDaemon) LoginProfile(ctx context.Context, id, user, k, mgmt string) (bool, error) {
+	f.calls = append(f.calls, "LoginProfile "+id+" "+mgmt)
+	f.active, f.user = id, user
+	return f.doLogin(ctx, k)
+}
+func (f *fakeDaemon) Login(ctx context.Context, k, mgmt string) (bool, error) {
+	f.calls = append(f.calls, "Login "+mgmt)
+	return f.doLogin(ctx, k)
+}
+func (f *fakeDaemon) doLogin(ctx context.Context, k string) (bool, error) {
+	f.loginKeys = append(f.loginKeys, k)
+	browser, err := f.browser, f.loginErr
+	if f.loginHook != nil {
+		browser, err = false, f.loginHook(ctx)
+	}
+	if f.strict {
+		if err != nil {
+			f.status = "LoginFailed"
+		} else {
+			f.status = "Idle"
+		}
+	}
+	return browser, err
+}
+func (f *fakeDaemon) activeID() string {
+	if f.active == "" {
+		return "default"
+	}
+	return f.active
+}
+
+// ActiveProfile и ListProfiles — чтение, в calls не пишутся.
+func (f *fakeDaemon) ActiveProfile(context.Context) (string, string, error) {
+	if f.activeErr != nil {
+		return "", "", f.activeErr
+	}
+	return f.activeID(), f.user, nil
+}
+func (f *fakeDaemon) ListProfiles(context.Context, string) ([]daemonclient.Profile, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	out := []daemonclient.Profile{{ID: "default", Name: "default", Active: f.activeID() == "default"}}
+	for _, id := range f.profiles {
+		out = append(out, daemonclient.Profile{ID: id, Name: f.names[id], Active: f.activeID() == id})
+	}
+	return out, nil
+}
+func (f *fakeDaemon) AddProfile(_ context.Context, name string) (string, string, error) {
+	f.calls = append(f.calls, "AddProfile")
+	if f.addErr != nil && !f.addCreates {
+		return "", "", f.addErr
+	}
+	if !strings.HasPrefix(name, "jetbox-") {
+		return "", "", fmt.Errorf("имя профиля %q", name)
+	}
+	id := fmt.Sprintf("new%d", len(f.profiles)+1)
+	f.profiles = append(f.profiles, id)
+	if f.names == nil {
+		f.names = map[string]string{}
+	}
+	f.names[id] = name
+	if f.addErr != nil {
+		return "", "", f.addErr
+	}
+	return id, f.user, nil
+}
+func (f *fakeDaemon) SwitchProfile(_ context.Context, id, user string) error {
+	f.calls = append(f.calls, "SwitchProfile "+id)
+	if err := f.switchErr[id]; err != nil {
+		return err
+	}
+	f.active, f.user = id, user
 	return nil
 }
-func (f *fakeDaemon) Login(_ context.Context, k, mgmt string) (bool, error) {
-	f.calls = append(f.calls, "Login "+mgmt)
-	f.loginKeys = append(f.loginKeys, k)
-	return f.browser, f.loginErr
+func (f *fakeDaemon) RemoveProfile(_ context.Context, id, _ string) error {
+	f.calls = append(f.calls, "RemoveProfile "+id)
+	if id == f.activeID() || id == "default" {
+		return errors.New("нельзя удалить активный профиль или default")
+	}
+	for i, p := range f.profiles {
+		if p == id {
+			if f.removeErr != nil {
+				return f.removeErr
+			}
+			f.profiles = append(f.profiles[:i], f.profiles[i+1:]...)
+			return nil
+		}
+	}
+	return status.Errorf(codes.NotFound, "profile %q not found", id)
 }
 func (f *fakeDaemon) Up(ctx context.Context) error {
 	f.calls = append(f.calls, "Up")
-	if f.upHook != nil {
-		return f.upHook(ctx)
+	if f.strict && f.status == "LoginFailed" {
+		return errors.New("up already in progress: current status LoginFailed")
 	}
-	return f.upErr
+	err := f.upErr
+	if f.upHook != nil {
+		err = f.upHook(ctx)
+	}
+	if f.strict && err == nil {
+		f.status = "Connected"
+	}
+	return err
 }
 func (f *fakeDaemon) Down(ctx context.Context) error {
 	f.calls = append(f.calls, "Down")
 	f.downCtx = append(f.downCtx, ctx.Err())
+	if f.strict && f.downErr == nil {
+		f.status = "Idle"
+	}
 	return f.downErr
 }
 func (f *fakeDaemon) Logout(context.Context) error {
@@ -230,55 +355,24 @@ func TestEmptyStoreButDaemonRegisteredIsForeign(t *testing.T) {
 	if _, err := f.Connect(context.Background(), link(t, demoLink), Options{ConfirmSwitch: true}, nil); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"Status", "Down", "Logout", "Configure https://netbird.jet-net.net JetBox", "Login https://netbird.jet-net.net", "Up", "SelectExit other-exit"}
+	want := append([]string{"Status", "Down", "AddProfile", "ConfigureProfile new1 https://netbird.jet-net.net JetBox", "LoginProfile new1 https://netbird.jet-net.net", "SwitchProfile new1", "Up"}, "SelectExit other-exit")
 	if !reflect.DeepEqual(d.calls, want) {
 		t.Fatalf("calls %v", d.calls)
 	}
 }
 
-func TestForeignLogoutFailsStops(t *testing.T) {
-	// Idle: движок не запущен, ListNetworks отвечает «not connected» (server/network.go:36-38)
-	d := &fakeDaemon{status: "Idle", netsErr: errors.New("not connected"), logoutErr: status.Error(codes.DeadlineExceeded, "context deadline exceeded")}
-	f, _ := newFlow(t, d)
-	_, err := f.Connect(context.Background(), link(t, demoLink), Options{ConfirmSwitch: true}, nil)
-	if KindOf(err) != KindServerUnreachable {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(d.calls, []string{"Status", "Down", "Logout"}) {
-		t.Fatalf("calls %v", d.calls)
-	}
-}
-
-func TestSwitchLogoutFailsSameManagementStops(t *testing.T) {
-	d := &fakeDaemon{status: "Connected", nets: demoNets, logoutErr: status.Error(codes.DeadlineExceeded, "context deadline exceeded")}
-	f, s := newFlow(t, d)
-	old := Box{Identity: "netbird.jet-net.net|other-exit", Name: "Старая", ManagementURL: "https://netbird.jet-net.net"}
-	_ = s.Save(old)
-	_, err := f.Connect(context.Background(), link(t, demoLink), Options{ConfirmSwitch: true}, nil)
-	var fe *Error
-	if !errors.As(err, &fe) || fe.Kind != KindServerUnreachable || fe.Detail != "не снять старую коробку" {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(d.calls, []string{"Status", "Down", "Logout"}) {
-		t.Fatalf("calls %v", d.calls)
-	}
-	if b, ok, _ := s.Load(); !ok || b != old {
-		t.Fatalf("старая коробка потеряна: %+v %v", b, ok)
-	}
-}
-
-func TestSwitchLogoutFailsOtherManagementContinues(t *testing.T) {
-	d := &fakeDaemon{status: "Connected", nets: demoNets, logoutErr: status.Error(codes.DeadlineExceeded, "context deadline exceeded")}
+func TestSwitchToOtherManagementUsesNewProfile(t *testing.T) {
+	d := &fakeDaemon{status: "Connected", nets: demoNets}
 	f, s := newFlow(t, d)
 	_ = s.Save(Box{Identity: "old.example.com|x", ManagementURL: "https://old.example.com"})
 	if _, err := f.Connect(context.Background(), link(t, demoLink), Options{ConfirmSwitch: true}, nil); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"Status", "Down", "Logout", "Configure https://netbird.jet-net.net JetBox", "Login https://netbird.jet-net.net", "Up", "SelectExit sv-demo-exit"}
+	want := append([]string{"Status", "Down", "AddProfile", "ConfigureProfile new1 https://netbird.jet-net.net JetBox", "LoginProfile new1 https://netbird.jet-net.net", "SwitchProfile new1", "Up"}, "SelectExit sv-demo-exit")
 	if !reflect.DeepEqual(d.calls, want) {
 		t.Fatalf("calls %v", d.calls)
 	}
-	if b, _, _ := s.Load(); b.Identity != "netbird.jet-net.net|sv-demo-exit" {
+	if b, _, _ := s.Load(); b.Identity != "netbird.jet-net.net|sv-demo-exit" || b.ProfileID != "new1" {
 		t.Fatalf("box %+v", b)
 	}
 }
@@ -368,14 +462,14 @@ func TestOtherBoxNeedsConfirmation(t *testing.T) {
 	}
 }
 
-func TestOtherBoxConfirmedLogsOutFirst(t *testing.T) {
+func TestOtherBoxConfirmedUsesNewProfile(t *testing.T) {
 	d := &fakeDaemon{status: "Connected", nets: demoNets}
 	f, s := newFlow(t, d)
 	_ = s.Save(Box{Identity: "netbird.jet-net.net|other-exit"})
 	if _, err := f.Connect(context.Background(), link(t, demoLink), Options{ConfirmSwitch: true}, nil); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"Status", "Down", "Logout", "Configure https://netbird.jet-net.net JetBox", "Login https://netbird.jet-net.net", "Up", "SelectExit sv-demo-exit"}
+	want := append([]string{"Status", "Down", "AddProfile", "ConfigureProfile new1 https://netbird.jet-net.net JetBox", "LoginProfile new1 https://netbird.jet-net.net", "SwitchProfile new1", "Up"}, "SelectExit sv-demo-exit")
 	if !reflect.DeepEqual(d.calls, want) {
 		t.Fatalf("calls %v", d.calls)
 	}

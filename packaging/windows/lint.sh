@@ -44,4 +44,15 @@ grep -q 'WriteRegStr HKLM "${ACTIVE_SETUP_KEY}" "StubPath" .*--autostart-init' "
   grep -q 'DeleteRegKey HKLM "${ACTIVE_SETUP_KEY}"' "$DIR/jetbox.nsi" &&
   grep -q 'ACTIVE_SETUP_KEY "Software\\Microsoft\\Active Setup\\Installed Components\\JetBox"' "$DIR/jetbox.nsi" || {
   echo "NSIS: ключ Active Setup JetBox (StubPath --autostart-init, IsInstalled) не пишется или не удаляется" >&2; exit 1; }
+# Профили службы нужны замене подключения (1.0.5): новая личность — новый профиль. Служба 1.0.4 сохранила
+# disable_profiles: true в service.json, и install без флага его восстановит — поэтому нужен явный
+# --disable-profiles=false, а включённый --disable-profiles (без =false) запрещён.
+if grep -n -E -- "--disable-profiles([^=]|=true|$)" "$DIR/jetbox.nsi" | grep -v -E "^[0-9]+:[[:space:]]*;" >&2; then
+  echo "NSIS: служба ставится с --disable-profiles — замена подключения не сможет завести профиль" >&2; exit 1
+fi
+grep -q -- "^!define DAEMON_FLAGS .*--disable-profiles=false" "$DIR/jetbox.nsi" || {
+  echo "NSIS: в DAEMON_FLAGS нет --disable-profiles=false (иначе служба возьмёт disable_profiles из service.json 1.0.4)" >&2; exit 1; }
+# Один файл состояния DNS/маршрутов на все профили службы.
+grep -q -- '^!define DAEMON_FLAGS .*--service-env NB_DNS_STATE_FILE="${DATA}\\state.json"' "$DIR/jetbox.nsi" || {
+  echo "NSIS: в DAEMON_FLAGS нет --service-env NB_DNS_STATE_FILE=\"\${DATA}\\state.json\"" >&2; exit 1; }
 echo "nsis lint: ok"

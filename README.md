@@ -33,6 +33,29 @@ The installer says this on its first page, before anything is installed:
 Uninstall (*Settings → Apps → JetBox*, or `Uninstall.exe /S`) unlinks the computer from JetBox and removes all of
 the above: the service, the adapter, firewall and DNS (NRPT) rules, the link handler, program files and data.
 
+## Replacing the connection
+
+The device's identity in NetBird is its WireGuard key. When the user opens a link with a **different setup key**
+while the computer is registered, it registers the computer under a **new identity** (for a link of another JetBox or
+account it asks first; a new link of the same JetBox connects without asking): a new
+service profile (`jetbox-<unixtime>`, new WireGuard key) is configured and logged in with the new key, and only
+then becomes the active one. If the login fails or is cancelled, the previous profile is made active again (its
+config is never touched) and the new one is removed. The previous profile and its peer are left
+untouched — the account (jet-net.net) removes the old peer. The same link opened again keeps the current identity.
+
+**Limitation — several Windows users.** Service profiles belong to the Windows user who created them, while the
+service (and the active profile) is one per computer. If a second Windows user replaces the connection, the active
+profile becomes theirs, and the first user's app then shows and controls that connection: the app does not switch
+another user's profile back (it only logs the mismatch with `box.json`). The app does not promise anything about this
+case.
+
+**Interrupted replacement.** `replace.json` next to `box.json` is written before the new profile is created and
+removed once the new connection is saved (or rolled back). If it is still there — the app was closed or the computer
+lost power midway — the app finishes the rollback at start (and before connecting): the profile from `box.json` is made
+active again and the half-registered new profile is removed; `replace.json` is deleted only once that profile is
+gone. Protection is not turned on by itself. A `box.json` whose service profile no longer exists (reinstall) is
+treated as no connection.
+
 ## Build
 
 Requirements: Go 1.26+, Node.js + pnpm, NSIS 3 (Windows installer), Xcode (macOS app).
@@ -62,3 +85,12 @@ JetBox подключает компьютер к вашему JetBox одной
 [jet-net.net](https://jet-net.net) → «Подключить» → «Под защитой». Работает поверх службы на основе открытого
 клиента NetBird (BSD-3-Clause), собранной из исходников тега `v0.81.4` с патчами из `daemon/patches`.
 Как собрать — раздел **Build** выше; лицензия — BSD-3-Clause.
+
+**Замена подключения.** Ссылка с другим setup key при живой регистрации (другой JetBox или абонент — после
+подтверждения, новая ссылка того же JetBox — без вопроса) — компьютер встаёт
+под новой личностью: новый профиль службы с новым ключом WireGuard; отказ входа — откат на прежний профиль.
+Прежний пир не трогаем — его убирает Кабинет. **Ограничение:** профили службы привязаны к пользователю Windows,
+а служба одна на компьютер — замена вторым пользователем делает активным его профиль, и первый пользователь
+увидит его подключение: чужой профиль приложение назад не переключает, только пишет расхождение в журнал.
+Прерванную замену (осталась replace.json) приложение доводит откатом при запуске; box.json, чьего профиля в
+службе нет (переустановка), считается отсутствующим.

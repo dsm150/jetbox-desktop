@@ -66,13 +66,13 @@ type Autostart struct {
 // State — всё, что рисует окно и трей. Ключа здесь нет — только маска.
 type State struct {
 	// Seq растёт с каждым изменением; окно отбрасывает состояние со Seq меньше уже показанного.
-	Seq         uint64          `json:"seq"`
-	Lang        string          `json:"lang"`
-	Version     string          `json:"version"`
-	Screen      Screen          `json:"screen"`
-	Stage       string          `json:"stage"` // registering | connecting | choosing-exit
-	BoxName     string          `json:"boxName"`
-	LinkBoxName string          `json:"linkBoxName"`
+	Seq         uint64 `json:"seq"`
+	Lang        string `json:"lang"`
+	Version     string `json:"version"`
+	Screen      Screen `json:"screen"`
+	Stage       string `json:"stage"` // registering | connecting | choosing-exit
+	BoxName     string `json:"boxName"`
+	LinkBoxName string `json:"linkBoxName"`
 	Host        string          `json:"host"`
 	KeyMask     string          `json:"keyMask"`
 	ExitName    string          `json:"exitName"`

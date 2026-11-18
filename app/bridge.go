@@ -47,6 +47,19 @@ type bridge struct {
 	lang string
 	auto autostarter // nil — автозапуск не трогаем (тесты)
 	dir  string      // каталог настроек: метка автозапуска по умолчанию
+	// sshOff выключает SSH-сервер NetBird в профилях службы; nil — не трогаем (тесты).
+	sshOff func(ctx context.Context) error
+	// recover доводит прерванную замену подключения (flow.Recover; changed — служба
+	// тронута); nil — не трогаем.
+	recover func(ctx context.Context) (changed bool, err error)
+
+	// Действия со службой в работе: «Выход» отменяет их и ждёт, пока они (и откат
+	// замены подключения) закончатся.
+	actMu    sync.Mutex
+	acts     map[int]context.CancelFunc
+	actSeq   int
+	actDone  sync.WaitGroup // Add — только под actMu и пока не quitting
+	quitting bool           // «Выход» начался: новые действия получают отменённый контекст
 
 	// Команды идут в контроллер напрямую, каждая в своей горутине: контроллер сам
 	// не пускает второе действие, пока идёт первое (Busy), и сам откладывает ссылку.
@@ -217,17 +230,81 @@ func (b *bridge) openLink(raw string) {
 	b.startMu.Unlock()
 	b.showWindow()
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
-		defer cancel()
+		ctx, done := b.action()
+		defer done()
 		b.ctl.OnLink(ctx, raw)
 	}()
 }
 
 // exec — команда окна или трея: прямо в контроллер, без общей очереди.
 func (b *bridge) exec(cmd, arg string) {
-	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
-	defer cancel()
+	ctx, done := b.action()
+	defer done()
 	b.dispatch(ctx, cmd, arg)
+}
+
+// action — контекст действия со службой (не дольше cmdTimeout), который отменит
+// «Выход»; done — действие закончено. После начала выхода — уже отменённый контекст:
+// действие сразу откажется, и выход его не ждёт.
+func (b *bridge) action() (context.Context, func()) {
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	b.actMu.Lock()
+	if b.quitting {
+		b.actMu.Unlock()
+		cancel()
+		return ctx, func() {}
+	}
+	if b.acts == nil {
+		b.acts = map[int]context.CancelFunc{}
+	}
+	b.actSeq++
+	id := b.actSeq
+	b.acts[id] = cancel
+	b.actDone.Add(1)
+	b.actMu.Unlock()
+	return ctx, func() {
+		b.actMu.Lock()
+		delete(b.acts, id)
+		b.actMu.Unlock()
+		cancel()
+		b.actDone.Done()
+	}
+}
+
+// quitWait — сколько «Выход» ждёт отменённые действия: откат замены подключения —
+// Down, SwitchProfile, Up (до 20 с) и удаление нового профиля (до 5 с).
+const quitWait = 45 * time.Second
+
+// quit — «Выход» из трея: отменить действия со службой и дождаться их конца (откат
+// замены успевает вернуть прежний профиль), но не дольше quitWait, затем выйти.
+// Флаг quitting ставится под actMu вместе с отменой: после него actDone.Add не
+// вызывается, и Wait не гоняется с Add.
+func (b *bridge) quit() {
+	b.actMu.Lock()
+	b.quitting = true
+	b.actMu.Unlock()
+	b.cancelActions()
+	waited := make(chan struct{})
+	go func() { b.actDone.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(quitWait):
+		log.Print("quit: действие не закончилось за отведённое время")
+	}
+	if b.app != nil {
+		b.app.Quit()
+	}
+}
+
+func (b *bridge) cancelActions() {
+	b.actMu.Lock()
+	defer b.actMu.Unlock()
+	if len(b.acts) > 0 {
+		log.Printf("quit: отменяем действий: %d", len(b.acts))
+	}
+	for _, cancel := range b.acts {
+		cancel()
+	}
 }
 
 func (b *bridge) onCmd(e *application.CustomEvent) {

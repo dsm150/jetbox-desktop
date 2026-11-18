@@ -357,6 +357,29 @@ func TestOtherBoxErrorFillsNames(t *testing.T) {
 	}
 }
 
+// Та же коробка, но ключ другой (Кабинет перевыпустил ссылку): LINK-CONTRACT 1.2 §2.11 —
+// без вопроса, сразу Connect (новую личность заводит flow).
+func TestSameBoxNewKeyConnectsWithoutAsking(t *testing.T) {
+	e := &fakeEngine{box: flow.Box{Identity: "netbird.jet-net.net|sv-demo-exit", Name: "Demo",
+		ManagementURL: "https://netbird.jet-net.net", KeyFingerprint: "00000000000000000000000000000000"}, hasBox: true}
+	c, _ := newCtl(e, &fakeStatus{st: connected()})
+	c.OnLink(context.Background(), demoLink)
+	if st := c.State(); st.Screen == ScreenSwitch || len(e.calls) == 0 {
+		t.Fatalf("та же коробка с новым ключом — без вопроса: %+v %v", st, e.calls)
+	}
+}
+
+// Другая коробка — вопрос без обращения к службе.
+func TestOtherBoxSwitchNotSame(t *testing.T) {
+	e := &fakeEngine{box: flow.Box{Identity: "netbird.jet-net.net|old-exit", Name: "Старый",
+		KeyFingerprint: "00000000000000000000000000000000"}, hasBox: true}
+	c, _ := newCtl(e, &fakeStatus{st: connected()})
+	c.OnLink(context.Background(), demoLink)
+	if st := c.State(); st.Screen != ScreenSwitch || len(e.calls) != 0 {
+		t.Fatalf("%+v %v", st, e.calls)
+	}
+}
+
 func TestOtherVPNThenIgnore(t *testing.T) {
 	e := &fakeEngine{err: &flow.Error{Kind: flow.KindOtherVPN, Detail: "NetBird"}}
 	c, _ := newCtl(e, &fakeStatus{st: connected()})

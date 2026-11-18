@@ -7,6 +7,8 @@
 package jetboxlink
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -34,6 +36,13 @@ type Payload struct {
 	ExitNode string
 	// BoxName — человекочитаемое имя коробки, пусто если не прислано.
 	BoxName string
+	// DeviceToken — токен устройства из облачной ссылки Кабинета (`t=`): свой на
+	// каждое устройство, «Новая ссылка» в Кабинете выдаёт новый. Секрет: целиком
+	// не показывается и не хранится, в удостоверение идёт только отпечаток.
+	DeviceToken string
+	// Platform — кабинетный параметр `p` («что подключаем», например windows).
+	// На поведение приложения не влияет (LINK-CONTRACT §2.8).
+	Platform string
 }
 
 // Outcome — исход разбора.
@@ -72,13 +81,43 @@ func (p Payload) DisplayName() string {
 	return p.ManagementURL
 }
 
-// BoxIdentity — признак «та же коробка»: management + выход (§4.2).
+// BoxIdentity — удостоверение подключения (LINK-CONTRACT 1.2 §2.11) для вопроса
+// о замене подключения:
+//   - есть выход `e` — `хост(m)|e` (коробка);
+//   - иначе есть токен устройства `t` — `хост(m)|t:<отпечаток t>` (облачный абонент);
+//   - иначе есть имя `n` — `хост(m)|n:<n>` (старые ссылки без e и t);
+//   - иначе — `хост(m)|`.
+//
+// Как в Android (boxIdentityOf): сам токен в удостоверение и в box.json не попадает.
+// Новая ли личность устройства (ключ WireGuard), решает не она, а KeyFingerprint.
 func (p Payload) BoxIdentity() string {
 	host := strings.ToLower(p.ManagementURL)
 	if u, err := url.Parse(p.ManagementURL); err == nil && u.Hostname() != "" {
 		host = strings.ToLower(u.Hostname())
 	}
-	return host + "|" + p.ExitNode
+	switch {
+	case p.ExitNode != "":
+		return host + "|" + p.ExitNode
+	case p.DeviceToken != "":
+		return host + "|t:" + Fingerprint(p.DeviceToken)
+	case p.BoxName != "":
+		return host + "|n:" + p.BoxName
+	}
+	return host + "|"
+}
+
+// KeyFingerprint — отпечаток setup key: по нему отличаем «та же ссылка» от «новая
+// ссылка», не храня сам ключ. Как JetBoxIdentity.fingerprint(of:) в iOS: регистр
+// UUID не важен.
+func (p Payload) KeyFingerprint() string {
+	return Fingerprint(strings.ToLower(p.SetupKey))
+}
+
+// Fingerprint — hex первых 16 байт SHA-256 строки (32 символа), как secretFingerprint
+// в Android. Регистр не меняет: setup key приводит к нижнему регистру KeyFingerprint.
+func Fingerprint(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:16])
 }
 
 // Parse разбирает ссылку: `jetbox://connect#…` или `https://box.jet-net.net/connect#…`.
@@ -117,6 +156,8 @@ func Parse(raw string) (Payload, Outcome) {
 		ManagementURL: mgmt,
 		ExitNode:      params["e"],
 		BoxName:       params["n"],
+		DeviceToken:   params["t"],
+		Platform:      params["p"],
 	}, OK
 }
 

@@ -39,6 +39,7 @@ export interface State {
   stage: string;
   boxName: string;
   linkBoxName: string;
+  /** Экран замены: ссылка той же коробки с новым ключом («обновим подключение»). */
   host: string;
   keyMask: string;
   exitName: string;

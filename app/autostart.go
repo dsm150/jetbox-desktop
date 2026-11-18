@@ -11,8 +11,8 @@ import (
 )
 
 // autostarter — «Запускать JetBox при входе» для этой ОС (Windows — HKCU\…\Run и отметка
-// «Диспетчера задач» в StartupApproved\Run). Где приложение автозапуск не ведёт (macOS — его ставит .pkg), supported=false:
-// строка в «Настройках» скрыта.
+// «Диспетчера задач» в StartupApproved\Run; macOS — launchctl enable/disable общего LaunchAgent из
+// .pkg). Где приложение автозапуск не ведёт, supported=false: строка в «Настройках» скрыта.
 type autostarter interface {
 	autostartSupported() bool
 	autostartEnabled() (bool, error)

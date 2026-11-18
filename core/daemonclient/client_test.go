@@ -24,9 +24,18 @@ type fakeServer struct {
 	status              *proto.StatusRequest
 	ups, downs, logouts int
 
-	profileErr error // GetActiveProfile отвечает этой ошибкой
-	needsSSO   bool  // Login просит вход через браузер
-	bigPeers   int   // Status отдаёт столько пиров по 1 КБ (проверка лимита сообщения)
+	profileErr error  // GetActiveProfile отвечает этой ошибкой
+	activeID   string // Id в ответе GetActiveProfile (пусто — как у старой службы)
+	noUser     bool   // GetActiveProfile без пользователя (так служба отвечает про default)
+	setConfigs []*proto.SetConfigRequest
+	setErr     map[string]error // ответ SetConfig по профилю
+	profiles   []*proto.Profile // ответ ListProfiles
+	listUser   string
+	added      *proto.AddProfileRequest
+	switched   *proto.SwitchProfileRequest
+	removed    *proto.RemoveProfileRequest
+	needsSSO   bool // Login просит вход через браузер
+	bigPeers   int  // Status отдаёт столько пиров по 1 КБ (проверка лимита сообщения)
 }
 
 func (f *fakeServer) Status(_ context.Context, r *proto.StatusRequest) (*proto.StatusResponse, error) {
@@ -46,10 +55,34 @@ func (f *fakeServer) GetActiveProfile(context.Context, *proto.GetActiveProfileRe
 	if f.profileErr != nil {
 		return nil, f.profileErr
 	}
-	return &proto.GetActiveProfileResponse{ProfileName: "default", Username: "ivan"}, nil
+	user := "ivan"
+	if f.noUser {
+		user = ""
+	}
+	return &proto.GetActiveProfileResponse{ProfileName: "default", Username: user, Id: f.activeID}, nil
+}
+func (f *fakeServer) ListProfiles(_ context.Context, r *proto.ListProfilesRequest) (*proto.ListProfilesResponse, error) {
+	f.listUser = r.GetUsername()
+	return &proto.ListProfilesResponse{Profiles: f.profiles}, nil
+}
+func (f *fakeServer) AddProfile(_ context.Context, r *proto.AddProfileRequest) (*proto.AddProfileResponse, error) {
+	f.added = r
+	return &proto.AddProfileResponse{Id: "0123abcd"}, nil
+}
+func (f *fakeServer) SwitchProfile(_ context.Context, r *proto.SwitchProfileRequest) (*proto.SwitchProfileResponse, error) {
+	f.switched = r
+	return &proto.SwitchProfileResponse{}, nil
+}
+func (f *fakeServer) RemoveProfile(_ context.Context, r *proto.RemoveProfileRequest) (*proto.RemoveProfileResponse, error) {
+	f.removed = r
+	return &proto.RemoveProfileResponse{}, nil
 }
 func (f *fakeServer) SetConfig(_ context.Context, r *proto.SetConfigRequest) (*proto.SetConfigResponse, error) {
 	f.setConfig = r
+	f.setConfigs = append(f.setConfigs, r)
+	if err := f.setErr[r.GetProfileName()]; err != nil {
+		return nil, err
+	}
 	return &proto.SetConfigResponse{}, nil
 }
 func (f *fakeServer) Login(_ context.Context, r *proto.LoginRequest) (*proto.LoginResponse, error) {
@@ -111,6 +144,27 @@ func TestConfigureSendsInterfaceAndPortThroughSetConfig(t *testing.T) {
 	if r == nil || r.GetProfileName() != "default" || r.GetUsername() != "ivan" ||
 		r.GetManagementUrl() != "https://netbird.jet-net.net" || r.GetInterfaceName() != "JetBox" || r.GetWireguardPort() != 51830 {
 		t.Fatalf("SetConfig = %+v", r)
+	}
+	if r.DisableAutoConnect != nil {
+		t.Fatalf("Configure активного трогает автоподключение: %+v", r)
+	}
+	assertSSHFirst(t, fs)
+}
+
+// Сначала отдельный SetConfig только с ServerSSHAllowed=false (ssh_gate смотрит
+// сохранённый конфиг), потом management — уже без поля SSH.
+func assertSSHFirst(t *testing.T, fs *fakeServer) {
+	t.Helper()
+	if len(fs.setConfigs) != 2 {
+		t.Fatalf("SetConfig %d раз, ждали 2", len(fs.setConfigs))
+	}
+	first, second := fs.setConfigs[0], fs.setConfigs[1]
+	if first.ServerSSHAllowed == nil || *first.ServerSSHAllowed || first.GetManagementUrl() != "" || first.InterfaceName != nil ||
+		first.GetProfileName() != second.GetProfileName() || first.GetUsername() != second.GetUsername() {
+		t.Fatalf("первый SetConfig = %+v", first)
+	}
+	if second.ServerSSHAllowed != nil {
+		t.Fatalf("второй SetConfig снова про SSH: %+v", second)
 	}
 }
 
@@ -262,5 +316,145 @@ func TestSetDisableAutoConnectProfileError(t *testing.T) {
 	fs.profileErr = errors.New("no profile")
 	if err := c.SetDisableAutoConnect(context.Background(), true); err == nil || fs.setConfig != nil {
 		t.Fatalf("err=%v setConfig=%+v", err, fs.setConfig)
+	}
+}
+
+func fakeUser(t *testing.T, name string) {
+	t.Helper()
+	prev := currentUser
+	currentUser = func() (string, error) { return name, nil }
+	t.Cleanup(func() { currentUser = prev })
+}
+
+// Профиль в запросах — по ID, если служба его назвала: одинаковые имена профилей не мешают.
+func TestActiveProfilePrefersID(t *testing.T) {
+	c, fs := newTestClient(t)
+	id, user, err := c.ActiveProfile(context.Background())
+	if err != nil || id != "default" || user != "ivan" {
+		t.Fatal(id, user, err)
+	}
+	fs.activeID = "a1b2c3"
+	if err := c.SetDisableAutoConnect(context.Background(), true); err != nil || fs.setConfig.GetProfileName() != "a1b2c3" {
+		t.Fatalf("SetConfig = %+v %v", fs.setConfig, err)
+	}
+}
+
+// SSH выключается сначала в активном профиле, затем адресно во всех остальных;
+// только этот флаг. Сбой по неактивному — не ошибка активного.
+func TestDisableServerSSHAllProfiles(t *testing.T) {
+	c, fs := newTestClient(t)
+	fs.activeID = "a1"
+	fs.profiles = []*proto.Profile{{Id: "default", Name: "default"}, {Id: "a1", Name: "jetbox-1", IsActive: true},
+		{Id: "b2", Name: "jetbox-2"}}
+	fs.setErr = map[string]error{"b2": errors.New("не принимаю")}
+	others, err := c.DisableServerSSH(context.Background())
+	if err != nil || others == nil || !strings.Contains(others.Error(), "b2") {
+		t.Fatal(others, err)
+	}
+	var got []string
+	for _, r := range fs.setConfigs {
+		if r.ServerSSHAllowed == nil || *r.ServerSSHAllowed || r.GetUsername() != "ivan" ||
+			r.GetManagementUrl() != "" || r.InterfaceName != nil || r.WireguardPort != nil || r.DisableAutoConnect != nil {
+			t.Fatalf("SetConfig = %+v", r)
+		}
+		got = append(got, r.GetProfileName())
+	}
+	if strings.Join(got, ",") != "a1,default,b2" || fs.listUser != "ivan" {
+		t.Fatalf("профили %v, ListProfiles для %q", got, fs.listUser)
+	}
+
+	fs.setConfigs, fs.setErr = nil, map[string]error{"a1": errors.New("служба занята")}
+	if _, err := c.DisableServerSSH(context.Background()); err == nil || len(fs.setConfigs) != 1 {
+		t.Fatalf("отказ по активному: err=%v вызовов=%d", err, len(fs.setConfigs))
+	}
+}
+
+// Новый профиль заводится для пользователя активного профиля; переключение и удаление —
+// с тем же пользователем.
+func TestAddSwitchRemoveProfile(t *testing.T) {
+	c, fs := newTestClient(t)
+	fakeUser(t, `PC\petr`)
+	ctx := context.Background()
+	id, user, err := c.AddProfile(ctx, "jetbox-1763300000")
+	if err != nil || id != "0123abcd" || user != "ivan" {
+		t.Fatal(id, user, err)
+	}
+	if fs.added.GetProfileName() != "jetbox-1763300000" || fs.added.GetUsername() != "ivan" {
+		t.Fatalf("AddProfile = %+v", fs.added)
+	}
+	if err := c.SwitchProfile(ctx, id, user); err != nil {
+		t.Fatal(err)
+	}
+	if fs.switched.GetProfileName() != "0123abcd" || fs.switched.GetUsername() != "ivan" {
+		t.Fatalf("SwitchProfile = %+v", fs.switched)
+	}
+	if err := c.RemoveProfile(ctx, id, user); err != nil {
+		t.Fatal(err)
+	}
+	if fs.removed.GetProfileName() != "0123abcd" || fs.removed.GetUsername() != "ivan" {
+		t.Fatalf("RemoveProfile = %+v", fs.removed)
+	}
+	// Обратно на default: пользователь не нужен, ОС не спрашиваем.
+	currentUser = func() (string, error) { return "", errors.New("нельзя") }
+	if err := c.SwitchProfile(ctx, "default", ""); err != nil || fs.switched.GetProfileName() != "default" {
+		t.Fatalf("SwitchProfile default = %+v %v", fs.switched, err)
+	}
+}
+
+// Активен default — служба хранит его без пользователя, а AddProfile без него не
+// создаст профиль: берём текущего пользователя ОС (как `netbird profile add`).
+func TestAddProfileFromDefaultUsesOSUser(t *testing.T) {
+	c, fs := newTestClient(t)
+	fs.noUser = true
+	fakeUser(t, `PC\petr`)
+	id, user, err := c.AddProfile(context.Background(), "jetbox-1")
+	if err != nil || id != "0123abcd" || user != `PC\petr` || fs.added.GetUsername() != `PC\petr` {
+		t.Fatal(id, user, err, fs.added)
+	}
+}
+
+// Новый профиль настраивается и входит адресно: ProfileName и Username в запросе.
+func TestConfigureAndLoginProfile(t *testing.T) {
+	c, fs := newTestClient(t)
+	ctx := context.Background()
+	if err := c.ConfigureProfile(ctx, "0123abcd", "ivan", "https://netbird.jet-net.net", "JetBox", 51830); err != nil {
+		t.Fatal(err)
+	}
+	r := fs.setConfig
+	if r.GetProfileName() != "0123abcd" || r.GetUsername() != "ivan" || r.GetManagementUrl() != "https://netbird.jet-net.net" ||
+		r.GetInterfaceName() != "JetBox" || r.GetWireguardPort() != 51830 || r.DisableAutoConnect == nil || !*r.DisableAutoConnect {
+		t.Fatalf("SetConfig = %+v", r)
+	}
+	assertSSHFirst(t, fs)
+	if _, err := c.LoginProfile(ctx, "0123abcd", "ivan", "0EF79C2F-1A34-4B21-9C0D-1BF529332998", "https://netbird.jet-net.net"); err != nil {
+		t.Fatal(err)
+	}
+	l := fs.login
+	if l.GetProfileName() != "0123abcd" || l.GetUsername() != "ivan" || l.GetHostname() != platform.DeviceName ||
+		l.GetSetupKey() != "0EF79C2F-1A34-4B21-9C0D-1BF529332998" {
+		t.Fatalf("Login = %+v", l)
+	}
+}
+
+func TestAddProfileWithoutUserFails(t *testing.T) {
+	c, fs := newTestClient(t)
+	fs.noUser = true
+	prev := currentUser
+	currentUser = func() (string, error) { return "", errors.New("нет пользователя") }
+	t.Cleanup(func() { currentUser = prev })
+	if _, _, err := c.AddProfile(context.Background(), "jetbox-1"); err == nil || fs.added != nil {
+		t.Fatalf("err=%v added=%+v", err, fs.added)
+	}
+}
+
+func TestListProfiles(t *testing.T) {
+	c, fs := newTestClient(t)
+	fs.profiles = []*proto.Profile{{Id: "default", Name: "default"}, {Id: "a1", Name: "jetbox-1", IsActive: true}, {Name: "old"}}
+	got, err := c.ListProfiles(context.Background(), "")
+	if err != nil || fs.listUser != "ivan" || len(got) != 3 || got[1] != (Profile{ID: "a1", Name: "jetbox-1", Active: true}) || got[2].ID != "old" {
+		t.Fatal(got, err, fs.listUser)
+	}
+	if _, err := c.ListProfiles(context.Background(), "petr"); err != nil || fs.listUser != "petr" {
+		t.Fatal(err, fs.listUser)
 	}
 }

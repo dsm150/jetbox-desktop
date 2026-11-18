@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -260,5 +261,78 @@ func TestScreenLogLineCarriesErrorDetail(t *testing.T) {
 	}
 	if got := screenLogLine(controller.State{Screen: controller.ScreenReady}); got != `screen ready errorKind=""` {
 		t.Fatalf("без отказа: %s", got)
+	}
+}
+
+// «Выход» во время действия: отменяет его контекст и ждёт, пока оно закончит откат.
+func TestQuitCancelsAndWaitsForActions(t *testing.T) {
+	b := &bridge{}
+	ctx, done := b.action()
+	rolledBack := make(chan struct{})
+	go func() {
+		<-ctx.Done()                      // отмена дошла до действия
+		time.Sleep(50 * time.Millisecond) // откат
+		close(rolledBack)
+		done()
+	}()
+	b.quit()
+	select {
+	case <-rolledBack:
+	default:
+		t.Fatal("выход не дождался отката")
+	}
+	// Без действий — сразу.
+	start := time.Now()
+	(&bridge{}).quit()
+	if time.Since(start) > time.Second {
+		t.Fatal("выход без действий ждал")
+	}
+}
+
+func TestRecoverReplaceLogsOnly(t *testing.T) {
+	calls := 0
+	b := &bridge{recover: func(context.Context) (bool, error) { calls++; return false, errors.New("служба занята") }}
+	b.recoverReplace(context.Background())
+	(&bridge{}).recoverReplace(context.Background()) // nil — ничего
+	if calls != 1 {
+		t.Fatal(calls)
+	}
+}
+
+// Сверка тронула службу — экран обновляется по её новому состоянию.
+func TestRecoverReplaceRefreshesScreen(t *testing.T) {
+	ts := &testStatus{state: "Connected"}
+	probe := func(context.Context, string) (time.Duration, error) { return 0, nil }
+	ctl := controller.New(&testEngine{}, ts, probe, func(controller.State) {}, "ru", "test")
+	ctl.Init(context.Background())
+	b := &bridge{ctl: ctl}
+	ts.mu.Lock()
+	ts.state = "Idle" // сверка опустила службу и вернула профиль
+	ts.mu.Unlock()
+	b.recover = func(context.Context) (bool, error) { return false, nil }
+	b.recoverReplace(context.Background())
+	if got := ctl.State().Panel.ServiceState; got != "Connected" {
+		t.Fatalf("без изменений экран не трогаем: %s", got)
+	}
+	b.recover = func(context.Context) (bool, error) { return true, nil }
+	b.recoverReplace(context.Background())
+	if got := ctl.State().Panel.ServiceState; got != "Idle" {
+		t.Fatalf("экран не обновлён: %s", got)
+	}
+}
+
+// После начала выхода новое действие получает отменённый контекст, и выход его не ждёт.
+func TestActionAfterQuitIsCanceled(t *testing.T) {
+	b := &bridge{}
+	b.quit()
+	ctx, done := b.action()
+	defer done()
+	if ctx.Err() == nil {
+		t.Fatal("контекст после выхода не отменён")
+	}
+	start := time.Now()
+	b.quit() // повторный выход не ждёт действие, взятое после флага
+	if time.Since(start) > time.Second {
+		t.Fatal("выход ждал действие, начатое после него")
 	}
 }

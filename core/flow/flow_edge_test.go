@@ -40,20 +40,19 @@ func TestNormManagement(t *testing.T) {
 
 func TestEmptyStoreDaemonOnOtherManagementNoQuestion(t *testing.T) {
 	// свежий профиль службы: Connecting к api.netbird.io (умолчание апстрима) —
-	// спрашивать не о чем; Down и Logout по возможности, их ошибки не мешают.
+	// спрашивать не о чем; регистрируемся в новом профиле, ошибка Down не мешает.
 	d := &fakeDaemon{status: "Connecting", mgmt: "https://api.netbird.io:443", nets: demoNets,
-		downErr:   errors.New("down failed"),
-		logoutErr: status.Error(codes.DeadlineExceeded, "context deadline exceeded")}
+		downErr: errors.New("down failed")}
 	f, s := newFlow(t, d)
 	res, err := f.Connect(context.Background(), link(t, demoLink), Options{}, nil)
 	if err != nil || res.ExitID != "sv-demo-exit" {
 		t.Fatal(res, err)
 	}
-	want := []string{"Status", "Down", "Logout", "Configure https://netbird.jet-net.net JetBox", "Login https://netbird.jet-net.net", "Up", "SelectExit sv-demo-exit"}
+	want := append([]string{"Status", "Down", "AddProfile", "ConfigureProfile new1 https://netbird.jet-net.net JetBox", "LoginProfile new1 https://netbird.jet-net.net", "SwitchProfile new1", "Up"}, "SelectExit sv-demo-exit")
 	if !reflect.DeepEqual(d.calls, want) {
 		t.Fatalf("calls %v", d.calls)
 	}
-	if b, ok, _ := s.Load(); !ok || b.Identity != "netbird.jet-net.net|sv-demo-exit" {
+	if b, ok, _ := s.Load(); !ok || b.Identity != "netbird.jet-net.net|sv-demo-exit" || b.ProfileID != "new1" {
 		t.Fatalf("box %+v %v", b, ok)
 	}
 }
@@ -115,32 +114,33 @@ func TestEmptyStoreSameManagementExitAbsentAsks(t *testing.T) {
 	}
 }
 
-func TestSwitchDaemonNeedsLoginLogoutFailureContinues(t *testing.T) {
-	// management уже отверг старую регистрацию (NeedsLogin): Logout ей не нужен.
-	d := &fakeDaemon{status: "NeedsLogin", nets: demoNets,
-		logoutErr: status.Error(codes.DeadlineExceeded, "context deadline exceeded")}
+// Как JetBoxIdentity.plan в iOS: другой ключ — всегда новая личность, на статус службы
+// не смотрим (NeedsLogin тоже): Configure management прежнего профиля не меняет.
+func TestNewKeyNeedsLoginStillNewProfile(t *testing.T) {
+	d := &fakeDaemon{status: "NeedsLogin", nets: demoNets}
 	f, s := newFlow(t, d)
 	_ = s.Save(Box{Identity: "netbird.jet-net.net|other-exit", ManagementURL: "https://netbird.jet-net.net"})
 	if _, err := f.Connect(context.Background(), link(t, demoLink), Options{ConfirmSwitch: true}, nil); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"Status", "Down", "Logout", "Configure https://netbird.jet-net.net JetBox", "Login https://netbird.jet-net.net", "Up", "SelectExit sv-demo-exit"}
-	if !reflect.DeepEqual(d.calls, want) {
-		t.Fatalf("calls %v", d.calls)
+	want := []string{"Status", "Down", "AddProfile", "ConfigureProfile new1 https://netbird.jet-net.net JetBox",
+		"LoginProfile new1 https://netbird.jet-net.net", "SwitchProfile new1", "Up", "SelectExit sv-demo-exit"}
+	if !reflect.DeepEqual(d.calls, want) || !reflect.DeepEqual(d.configured, []string{"new1"}) {
+		t.Fatalf("calls %v configured %v", d.calls, d.configured)
 	}
 }
 
-func TestSwitchSameManagementIsNormalized(t *testing.T) {
-	// :443 и хвостовой слэш — тот же management: Logout не прошёл — стоп.
-	d := &fakeDaemon{status: "Connected", nets: demoNets,
-		logoutErr: status.Error(codes.DeadlineExceeded, "context deadline exceeded")}
+func TestSameKeySameManagementIsNormalized(t *testing.T) {
+	// :443 и хвостовой слэш — тот же management: тот же ключ — то же подключение.
+	d := &fakeDaemon{status: "Connected", nets: demoNets}
 	f, s := newFlow(t, d)
-	_ = s.Save(Box{Identity: "netbird.jet-net.net|other-exit", ManagementURL: "https://NetBird.jet-net.net:443/"})
-	_, err := f.Connect(context.Background(), link(t, demoLink), Options{ConfirmSwitch: true}, nil)
-	if KindOf(err) != KindServerUnreachable {
+	l := link(t, demoLink)
+	_ = s.Save(Box{Identity: "netbird.jet-net.net|other-exit", ManagementURL: "https://NetBird.jet-net.net:443/",
+		KeyFingerprint: l.KeyFingerprint()})
+	if _, err := f.Connect(context.Background(), l, Options{}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(d.calls, []string{"Status", "Down", "Logout"}) {
+	if !reflect.DeepEqual(d.calls, []string{"Status", "Login https://netbird.jet-net.net", "Up", "SelectExit sv-demo-exit"}) {
 		t.Fatalf("calls %v", d.calls)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/dsm150/jetbox-desktop/core/daemonclient"
 	"github.com/dsm150/jetbox-desktop/core/exitpick"
 	"github.com/dsm150/jetbox-desktop/core/jetboxlink"
 )
@@ -28,6 +30,19 @@ type Daemon interface {
 	Up(ctx context.Context) error
 	Down(ctx context.Context) error
 	Logout(ctx context.Context) error
+	// Профили службы: новая личность устройства (ключ WireGuard) — новый профиль.
+	ActiveProfile(ctx context.Context) (id, username string, err error)
+	AddProfile(ctx context.Context, name string) (id, username string, err error)
+	// ConfigureProfile — Configure адресно в новый профиль id, активным он не
+	// становится; служба не поднимает его сама при старте (DisableAutoConnect).
+	ConfigureProfile(ctx context.Context, id, username, managementURL, iface string, port int64) error
+	// LoginProfile — Login в профиль id: служба делает его активным сама, до входа,
+	// и при отказе не возвращает прежний.
+	LoginProfile(ctx context.Context, id, username, setupKey, managementURL string) (needsBrowser bool, err error)
+	SwitchProfile(ctx context.Context, id, username string) error
+	RemoveProfile(ctx context.Context, id, username string) error
+	// ListProfiles — профили пользователя username (пусто — пользователя активного).
+	ListProfiles(ctx context.Context, username string) ([]daemonclient.Profile, error)
 	Networks(ctx context.Context) ([]exitpick.Network, error)
 	SelectExit(ctx context.Context, id string) error
 	DeselectExits(ctx context.Context, ids []string) error
@@ -172,10 +187,15 @@ func normManagement(raw string) string {
 
 func sameManagement(a, b string) bool { return normManagement(a) == normManagement(b) }
 
-// rejectedByManagement — management уже отверг регистрацию службы: старая
-// запись пира недействительна, и неудачный Logout ничего не оставляет.
-func rejectedByManagement(status string) bool {
-	return status == "NeedsLogin" || status == "SessionExpired"
+// SameConnection — ссылка ведёт к тому же подключению, что запомнено: тот же
+// management и тот же setup key (по отпечатку, как JetBoxIdentity.plan в iOS).
+// Запись до 1.0.5 без отпечатка — по удостоверению (LINK-CONTRACT 1.2 §2.11).
+// Не то же — нужна новая личность устройства и вопрос «заменить подключение?».
+func SameConnection(b Box, link jetboxlink.Payload) bool {
+	if b.KeyFingerprint == "" {
+		return b.Identity == link.BoxIdentity()
+	}
+	return sameManagement(b.ManagementURL, link.ManagementURL) && b.KeyFingerprint == link.KeyFingerprint()
 }
 
 // hasExit — выход из ссылки виден службе (значит, она зарегистрирована в той
@@ -197,37 +217,35 @@ func (f *Flow) hasExit(ctx context.Context, id string) bool {
 	return false
 }
 
-// leave снимает с учёта прежнюю регистрацию перед новой. Если Logout не прошёл,
-// а strict (management тот же и регистрацию он не отверг) — останавливаемся:
-// Login на тот же management вернёт OK, не потратив новый ключ, и компьютер
-// остался бы на старой коробке. Иначе Logout не важен: новый Configure+Login
-// его перекроет.
-func (f *Flow) leave(ctx context.Context, strict bool) error {
-	_ = f.d.Down(ctx)
-	f.syncAutoConnect(ctx, false) // Logout не пройдёт — после перезагрузки к старой не подключится
-	if err := f.d.Logout(ctx); err != nil && strict {
-		return f.netError(ctx, "не снять старую коробку", err)
-	}
-	_ = f.store.Clear()
-	return nil
-}
-
 // Connect — нажатие «Подключить» по ссылке.
 //
-// Порядок: Status → чужой VPN → запомненная коробка. Другая коробка — только с
-// подтверждением: Down, Logout, затем регистрация. Пустое хранилище при
-// зарегистрированной службе: другой management — без вопроса (Down и Logout по
-// возможности); тот же management и выход ссылки виден службе — та же коробка,
-// принимаем как есть; иначе «другая JetBox» с подтверждением. Своя коробка:
-// Configure не нужен, но Login вызывается всегда — служба вернёт OK без ключа,
-// если пир жив, и перерегистрирует, если его удалили. Коробка запоминается
-// сразу после Login. Отмена ctx после Up опускает службу (abortUp).
+// Порядок: сверка профиля службы (recover) → Status → чужой VPN → запомненная
+// коробка. Личность устройства в NetBird — ключ WireGuard в профиле службы: вход
+// новым setup key со старым ключом management не применит (узнает пир по ключу).
+// Поэтому, как JetBoxIdentity.plan в iOS:
+//   - та же ссылка (SameConnection) — Login тем же ключом в текущем профиле: служба
+//     вернёт OK без ключа, если пир жив, и перерегистрирует, если его удалили;
+//     служба не зарегистрирована — Configure и Login там же;
+//   - другая ссылка — только с подтверждением и всегда новой личностью: новый
+//     профиль службы (replace) с откатом при неудаче, каков бы ни был статус службы;
+//   - пустое хранилище: служба не зарегистрирована — первый вход в текущем профиле;
+//     зарегистрирована на другой management — новый профиль без вопроса; тот же
+//     management и выход ссылки виден службе — та же коробка, принимаем как есть;
+//     иначе «другая JetBox» с подтверждением и новым профилем.
+//
+// Logout при замене не зовётся: прежний пир убирает Кабинет. Коробка запоминается
+// сразу после Login, с профилем службы. Отмена ctx после Up опускает службу (abortUp).
 func (f *Flow) Connect(ctx context.Context, link jetboxlink.Payload, opts Options, progress func(Stage)) (Result, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if progress == nil {
 		progress = func(Stage) {}
 	}
+	rec, err := f.recover(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	cur := rec.cur
 	st, err := f.d.Status(ctx)
 	if err != nil {
 		return Result{}, &Error{Kind: KindServiceMissing, Detail: "служба не отвечает", Err: err}
@@ -242,25 +260,29 @@ func (f *Flow) Connect(ctx context.Context, link jetboxlink.Payload, opts Option
 	if err != nil {
 		return Result{}, &Error{Kind: KindUnknown, Detail: "не прочитать сохранённую коробку", Err: err}
 	}
+	if rec.staleBox {
+		// Профиля коробки в службе нет (переустановка): как будто коробки нет.
+		stored, has = Box{}, false
+	}
 	daemonStatus := st.GetStatus()
 	registered := !needsLogin(daemonStatus)
-	same := has && stored.Identity == link.BoxIdentity()
+	wasOn := daemonStatus == "Connected" || daemonStatus == "Connecting"
+	same := has && SameConnection(stored, link)
+	sameBox := has && stored.Identity == link.BoxIdentity()
 	if same && daemonStatus == "LoginFailed" {
 		// LoginFailed — не прошла проверка входа (сеть, сбой management;
 		// server.go:769-772), а не отказ в регистрации: она, скорее всего, жива.
 		registered = true
 	}
-	adopt := false // своя коробка, забытая хранилищем
+	adopt, replace := false, false // adopt — своя коробка, забытая хранилищем
 	switch {
 	case has && !same:
-		if !opts.ConfirmSwitch {
+		// LINK-CONTRACT 1.2 §2.11: то же удостоверение (та же коробка, новая ссылка) —
+		// без вопроса, как iOS/Android; другое — только с подтверждением.
+		if !sameBox && !opts.ConfirmSwitch {
 			return Result{}, &Error{Kind: KindOtherBox, Detail: stored.Name}
 		}
-		strict := sameManagement(stored.ManagementURL, link.ManagementURL) && !rejectedByManagement(daemonStatus)
-		if err := f.leave(ctx, strict); err != nil {
-			return Result{}, err
-		}
-		registered = false
+		replace = true
 	case !has && registered:
 		// Служба зарегистрирована, а мы ничего не помним. Служба называет свой
 		// management (из профиля; server.go:1898); пусто — неизвестен, считаем тем же.
@@ -268,23 +290,27 @@ func (f *Flow) Connect(ctx context.Context, link jetboxlink.Payload, opts Option
 		switch {
 		case daemonMgmt != "" && !sameManagement(daemonMgmt, link.ManagementURL):
 			// Другой management (например, api.netbird.io:443 свежего профиля):
-			// спрашивать не о чем, снимаем по возможности и регистрируемся.
-			_ = f.leave(ctx, false)
-			registered = false
+			// спрашивать не о чем, регистрируемся в новом профиле.
+			replace = true
 		case f.hasExit(ctx, link.ExitNode):
 			// Тот же management и выход коробки виден службе — та же коробка
 			// (второй пользователь Windows, потерянный %APPDATA%): принимаем
-			// регистрацию как есть, без Logout и Configure.
+			// регистрацию как есть, без Configure.
 			adopt = true
 		default:
 			if !opts.ConfirmSwitch {
 				return Result{}, &Error{Kind: KindOtherBox, Detail: ""}
 			}
-			if err := f.leave(ctx, true); err != nil {
-				return Result{}, err
-			}
-			registered = false
+			replace = true
 		}
+	}
+
+	if replace {
+		prof, err := f.replace(ctx, link, cur, wasOn, progress)
+		if err != nil {
+			return Result{}, err
+		}
+		return f.finish(ctx, link, stored, has, sameBox, true, prof, true, progress)
 	}
 
 	// Новая регистрация — всё, кроме своей (или принятой) коробки на живой регистрации.
@@ -297,17 +323,305 @@ func (f *Flow) Connect(ctx context.Context, link jetboxlink.Payload, opts Option
 	} else {
 		progress(StageConnecting)
 	}
-	browser, err := f.d.Login(ctx, link.SetupKey, link.ManagementURL)
-	if err != nil {
-		if canceled(ctx, err) {
-			return Result{}, cancelError(ctx, "регистрация прервана", err)
-		}
-		return Result{}, &Error{Kind: f.refine(ctx, classifyLogin(err)), Detail: "регистрация", Err: err}
+	if err := f.login(ctx, link); err != nil {
+		return Result{}, err
 	}
-	if browser {
-		return Result{}, &Error{Kind: KindNeedsBrowserLogin, Detail: "сервер просит вход через браузер"}
+	return f.finish(ctx, link, stored, has, sameBox, fresh, cur, false, progress)
+}
+
+// profileRef — профиль службы: ID (у старой службы — имя) и пользователь.
+type profileRef struct{ ID, User string }
+
+// defaultProfile — профиль службы, который есть всегда; им считается коробка без
+// ProfileID (до 1.0.5 профили были выключены).
+const defaultProfile = "default"
+
+// boxProfile — профиль службы, в котором зарегистрирована коробка.
+func boxProfile(b Box) profileRef {
+	if b.ProfileID == "" {
+		return profileRef{ID: defaultProfile}
+	}
+	return profileRef{ID: b.ProfileID, User: b.ProfileUser}
+}
+
+// Recover доводит прерванную замену подключения (см. recover). Для запуска
+// приложения; Connect и Reconnect делают это сами. changed — служба тронута
+// (переключён профиль или удалён новый): экран стоит обновить.
+func (f *Flow) Recover(ctx context.Context) (changed bool, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, err := f.recover(ctx)
+	return r.changed, err
+}
+
+// recovered — итог сверки: активный профиль после неё, коробка устарела (её профиля
+// в службе нет — переустановка с оставшимся %APPDATA%), служба тронута.
+type recovered struct {
+	cur      profileRef
+	staleBox bool
+	changed  bool
+}
+
+// recover сверяет активный профиль службы с коробкой и доводит прерванную замену.
+//
+// Без replace.json службу НЕ трогает: другой активный профиль — это может быть
+// второй пользователь Windows (служба одна на компьютер) или переустановка; только
+// пишет расхождение в журнал. Профиля коробки в службе нет — коробка устарела
+// (staleBox: Connect считает, что коробки нет).
+//
+// С replace.json (замену прервал выход приложения или сбой питания — этот же
+// пользователь) — довести откат: активен не профиль коробки (коробки нет или она
+// устарела — прежний из записи; и его нет — default) — Down и SwitchProfile на него,
+// без Up (человек нажмёт щит); затем удалить недорегистрированный новый профиль (по ID,
+// или по имени из ListProfiles, если AddProfile прервали), кроме профиля коробки.
+// Запись стирается, только когда нового профиля точно нет.
+//
+// Служба не отвечает — KindServiceMissing; не удалось переключить — KindUnknown,
+// запись остаётся до следующей попытки.
+func (f *Flow) recover(ctx context.Context) (recovered, error) {
+	id, user, err := f.d.ActiveProfile(ctx)
+	if err != nil {
+		return recovered{}, &Error{Kind: KindServiceMissing, Detail: "служба не отвечает", Err: err}
+	}
+	r := recovered{cur: profileRef{ID: id, User: user}}
+	j, hasJ := f.store.LoadReplace()
+	box, hasBox, _ := f.store.Load()
+	boxProf := boxProfile(box)
+	if hasBox && boxProf.ID != r.cur.ID {
+		if found, known := f.profileExists(ctx, boxProf); known && !found {
+			f.logf("сверка профиля: профиля коробки %s в службе нет — коробка устарела", boxProf.ID)
+			r.staleBox = true
+		} else if !hasJ {
+			f.logf("сверка профиля: активен %s (%s), коробка в %s (%s) — службу не трогаем",
+				r.cur.ID, r.cur.User, boxProf.ID, boxProf.User)
+		}
+	}
+	if !hasJ {
+		return r, nil
 	}
 
+	target := profileRef{ID: j.OldID, User: j.OldUser}
+	if hasBox && !r.staleBox {
+		target = boxProf
+	} else if found, known := f.profileExists(ctx, target); known && !found {
+		target = profileRef{ID: defaultProfile}
+	}
+	if r.cur.ID != target.ID {
+		f.logf("сверка профиля: прерванная замена — активен %s, возвращаем %s", r.cur.ID, target.ID)
+		_ = f.d.Down(ctx)
+		if err := f.d.SwitchProfile(ctx, target.ID, target.User); err != nil {
+			return r, &Error{Kind: KindUnknown, Detail: "возврат профиля службы", Err: err}
+		}
+		r.cur, r.changed = target, true
+	}
+	f.logf("сверка профиля: доводим прерванную замену (новый профиль %s %s)", j.NewName, j.NewID)
+	removed, gone := f.removeNew(ctx, j, r.cur.ID, target.ID)
+	r.changed = r.changed || removed
+	if gone {
+		if err := f.store.ClearReplace(); err != nil {
+			f.logf("сверка профиля: запись о замене: %v", err)
+		}
+	}
+	return r, nil
+}
+
+// profileExists — есть ли профиль в службе (ListProfiles его пользователя). known=false —
+// узнать не удалось. default есть всегда.
+func (f *Flow) profileExists(ctx context.Context, p profileRef) (found, known bool) {
+	if p.ID == defaultProfile {
+		return true, true
+	}
+	list, err := f.d.ListProfiles(ctx, p.User)
+	if err != nil {
+		f.logf("сверка профиля: список профилей: %v", err)
+		return false, false
+	}
+	for _, q := range list {
+		if q.ID == p.ID {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// removeNew удаляет новый профиль незаконченной замены — его пир не зарегистрирован
+// (или регистрация брошена). По ID, а если AddProfile прервали до ответа — по имени из
+// ListProfiles. Профили keep и default не трогает. RemoveProfile ходит в management
+// снимать пир, поэтому — своим коротким контекстом (5 с), не держа замену; ошибки —
+// в журнал. removed — что-то удалено; gone — нового профиля точно нет (удалён, не
+// найден или его оставили как профиль коробки): запись о замене можно стереть.
+func (f *Flow) removeNew(ctx context.Context, j Replace, keep ...string) (removed, gone bool) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), removeTimeout)
+	defer cancel()
+	user := j.NewUser
+	if user == "" {
+		user = j.OldUser
+	}
+	var ids []string
+	switch {
+	case j.NewID != "":
+		ids = []string{j.NewID}
+	case j.NewName != "":
+		list, err := f.d.ListProfiles(rctx, user)
+		if err != nil {
+			f.logf("замена: найти профиль %s: %v", j.NewName, err)
+			return false, false
+		}
+		for _, p := range list {
+			if p.Name == j.NewName {
+				ids = append(ids, p.ID)
+			}
+		}
+	}
+	gone = true
+	for _, id := range ids {
+		if id == defaultProfile || slices.Contains(keep, id) {
+			continue
+		}
+		err := f.d.RemoveProfile(rctx, id, user)
+		switch {
+		case err == nil:
+			removed = true
+		case status.Code(err) == codes.NotFound:
+		default:
+			f.logf("замена: удалить профиль %s: %v", id, err)
+			gone = false
+		}
+	}
+	return removed, gone
+}
+
+// Тайм-ауты отката: Down/SwitchProfile, Up прежнего, удаление нового профиля.
+const (
+	rollbackTimeout = 15 * time.Second
+	rollbackUp      = 20 * time.Second
+	removeTimeout   = 5 * time.Second
+)
+
+// login — вход ключом ссылки в активный профиль.
+func (f *Flow) login(ctx context.Context, link jetboxlink.Payload) error {
+	browser, err := f.d.Login(ctx, link.SetupKey, link.ManagementURL)
+	return f.loginError(ctx, browser, err)
+}
+
+// loginError сводит итог Login к отказу (classifyLogin, refine); nil — вход прошёл.
+func (f *Flow) loginError(ctx context.Context, browser bool, err error) error {
+	if err != nil {
+		if canceled(ctx, err) {
+			return cancelError(ctx, "регистрация прервана", err)
+		}
+		return &Error{Kind: f.refine(ctx, classifyLogin(err)), Detail: "регистрация", Err: err}
+	}
+	if browser {
+		return &Error{Kind: KindNeedsBrowserLogin, Detail: "сервер просит вход через браузер"}
+	}
+	return nil
+}
+
+// replace — замена подключения новой личностью: новый профиль службы (служба
+// создаёт его сразу с новым ключом WireGuard), Configure адресно в него, Login
+// ключом ссылки в него, и только после удачного входа — SwitchProfile на него.
+// cur — активный профиль до замены. Возвращает новый профиль.
+//
+// Login с именем профиля служба выполняет, сделав его активным (server.go
+// authorizeAndPrepareLogin → switchProfileIfNeeded), и при отказе не возвращает
+// прежний: это делает откат. Конфиг прежнего профиля не меняется ни на одном шаге.
+//
+// Перед AddProfile пишется replace.json (Replace): прервут замену — откат доведёт
+// recover. Удаляется после сохранения коробки (finish) или после отката.
+//
+// Прежний профиль и его пир не трогаем: ни Logout, ни RemoveProfile (служба при
+// удалении профиля снимает его пир с учёта) — пир уберёт Кабинет. Любой отказ до
+// успешного входа (и отмена) — откат (rollback); box.json не меняется.
+func (f *Flow) replace(ctx context.Context, link jetboxlink.Payload, cur profileRef, wasOn bool, progress func(Stage)) (profileRef, error) {
+	progress(StageRegistering)
+	j := Replace{OldID: cur.ID, OldUser: cur.User, NewName: fmt.Sprintf("jetbox-%d", time.Now().Unix()), At: time.Now().UTC()}
+	if err := f.store.SaveReplace(j); err != nil {
+		return profileRef{}, &Error{Kind: KindUnknown, Detail: "запись о замене", Err: err}
+	}
+	_ = f.d.Down(ctx)
+	newID, newUser, err := f.d.AddProfile(ctx, j.NewName)
+	if err != nil {
+		f.rollback(ctx, j, false, wasOn)
+		return profileRef{}, f.stepError(ctx, "новый профиль службы", err)
+	}
+	j.NewID, j.NewUser = newID, newUser
+	if err := f.store.SaveReplace(j); err != nil {
+		f.logf("замена: запись о замене: %v", err) // без ID новый найдётся по имени
+	}
+	if err := f.d.ConfigureProfile(ctx, newID, newUser, link.ManagementURL, f.cfg.Iface, f.cfg.Port); err != nil {
+		f.rollback(ctx, j, false, wasOn)
+		return profileRef{}, f.stepError(ctx, "настройка службы", err)
+	}
+	browser, err := f.d.LoginProfile(ctx, newID, newUser, link.SetupKey, link.ManagementURL)
+	if err := f.loginError(ctx, browser, err); err != nil {
+		f.rollback(ctx, j, true, wasOn)
+		return profileRef{}, err
+	}
+	// Login уже сделал новый профиль активным; явный SwitchProfile — чтобы служба
+	// перечитала его конфиг. Новый пир зарегистрирован — отката нет, сбой только в журнал.
+	if err := f.d.SwitchProfile(ctx, newID, newUser); err != nil {
+		f.logf("замена: переключение на профиль %s после входа: %v", newID, err)
+	}
+	return profileRef{ID: newID, User: newUser}, nil
+}
+
+// stepError — отказ шага замены: отмена видна через errors.Is, прочее — Unknown.
+func (f *Flow) stepError(ctx context.Context, detail string, err error) error {
+	if canceled(ctx, err) {
+		return cancelError(ctx, "замена подключения прервана", err)
+	}
+	return &Error{Kind: KindUnknown, Detail: detail, Err: err}
+}
+
+// rollback возвращает всё, как было до замены j, контекстами, которые отмена не
+// задела:
+//  1. Down — после неудачного Login служба остаётся в LoginFailed, и Up ответил бы
+//     «up already in progress» (server.go:770-799, 1197); Down сбрасывает в Idle;
+//  2. SwitchProfile на прежний — если служба могла сделать активным новый (switchBack:
+//     был Login). Не вышло — стоп: запись о замене остаётся, откат доведёт recover;
+//  3. Up прежнего со своим тайм-аутом — если защита была включена;
+//  4. RemoveProfile нового последним, коротким контекстом (removeNew).
+//
+// Ошибки — только в журнал: человек увидит отказ самой замены.
+func (f *Flow) rollback(ctx context.Context, j Replace, switchBack, wasOn bool) {
+	base := context.WithoutCancel(ctx)
+	rctx, cancel := context.WithTimeout(base, rollbackTimeout)
+	defer cancel()
+	_ = f.d.Down(rctx)
+	if switchBack {
+		if err := f.d.SwitchProfile(rctx, j.OldID, j.OldUser); err != nil {
+			f.logf("откат замены: прежний профиль %s: %v", j.OldID, err)
+			return
+		}
+	}
+	if wasOn {
+		uctx, ucancel := context.WithTimeout(base, rollbackUp)
+		if err := f.d.Up(uctx); err != nil {
+			f.logf("откат замены: включить прежнее подключение: %v", err)
+		}
+		ucancel()
+	}
+	if _, gone := f.removeNew(ctx, j, j.OldID); !gone {
+		return // новый профиль остался — запись нужна следующей сверке
+	}
+	if err := f.store.ClearReplace(); err != nil {
+		f.logf("откат замены: запись о замене: %v", err)
+	}
+}
+
+func (f *Flow) logf(format string, args ...any) {
+	if f.cfg.Logf != nil {
+		f.cfg.Logf(format, args...)
+	}
+}
+
+// finish — после успешного входа: запомнить коробку (с отпечатком ключа и профилем
+// службы prof), поднять туннель и выбрать выход. keepChoice — та же коробка
+// (удостоверение): выбор выхода человека сохраняется. fresh — новая регистрация (дата —
+// сейчас). replaced — это замена: после сохранения коробки запись о ней удаляется.
+func (f *Flow) finish(ctx context.Context, link jetboxlink.Payload, stored Box, has, keepChoice, fresh bool,
+	prof profileRef, replaced bool, progress func(Stage)) (Result, error) {
 	box := Box{
 		Identity:      link.BoxIdentity(),
 		Name:          link.DisplayName(),
@@ -315,21 +629,29 @@ func (f *Flow) Connect(ctx context.Context, link jetboxlink.Payload, opts Option
 		ExitNode:      link.ExitNode,
 		RegisteredAt:  time.Now().UTC(),
 		// Галочка — выбор человека для компьютера: переживает и смену коробки.
-		AutoConnect: !has || stored.AutoConnect,
+		AutoConnect:    !has || stored.AutoConnect,
+		KeyFingerprint: link.KeyFingerprint(),
+		ProfileID:      prof.ID,
+		ProfileUser:    prof.User,
 	}
 	saved := exitpick.Saved{}
-	if same {
+	if keepChoice {
 		saved = exitpick.Saved{ID: stored.ExitNode, NoExit: stored.NoExit}
 		if stored.ExitNode != "" {
 			box.ExitNode = stored.ExitNode
 		}
 		box.NoExit = stored.NoExit
-		if !fresh {
-			box.RegisteredAt = stored.RegisteredAt
-		}
+	}
+	if has && !fresh {
+		box.RegisteredAt = stored.RegisteredAt
 	}
 	if err := f.store.Save(box); err != nil {
 		return Result{}, &Error{Kind: KindUnknown, Detail: "не сохранить коробку", Err: err}
+	}
+	if replaced {
+		if err := f.store.ClearReplace(); err != nil {
+			f.logf("замена: запись о замене: %v", err)
+		}
 	}
 
 	if fresh {
@@ -397,8 +719,8 @@ func (f *Flow) abortUp(ctx context.Context, err error) *Error {
 // включили (Up), иначе её выключили. Нет коробки — флаг ставится. Ошибка действию
 // не мешает: только в журнал (служба при старте поступит по прежнему флагу).
 func (f *Flow) syncAutoConnect(ctx context.Context, on bool) {
-	if err := f.setAutoConnectFlag(ctx, on); err != nil && f.cfg.Logf != nil {
-		f.cfg.Logf("автоподключение службы (защита включена=%v): %v", on, err)
+	if err := f.setAutoConnectFlag(ctx, on); err != nil {
+		f.logf("автоподключение службы (защита включена=%v): %v", on, err)
 	}
 }
 
@@ -595,7 +917,8 @@ func (f *Flow) Disconnect(ctx context.Context) error {
 	return nil
 }
 
-// Reconnect поднимает туннель к запомненной коробке без ссылки.
+// Reconnect поднимает туннель к запомненной коробке без ссылки. Сначала сверка
+// профиля службы с коробкой (recover).
 //
 // NeedsLogin/SessionExpired — management отверг регистрацию: KindNeedsLink
 // (нужна ссылка), Up не вызывается. LoginFailed — прошлая проверка входа не
@@ -605,6 +928,9 @@ func (f *Flow) Disconnect(ctx context.Context) error {
 func (f *Flow) Reconnect(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, err := f.recover(ctx); err != nil {
+		return err
+	}
 	st, err := f.d.Status(ctx)
 	if err != nil {
 		return &Error{Kind: KindServiceMissing, Detail: "служба не отвечает", Err: err}

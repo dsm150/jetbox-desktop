@@ -125,6 +125,10 @@ func TestCabinetParameterPIsIgnored(t *testing.T) {
 	base := "https://box.jet-net.net/connect#k=" + key + "&m=https%3A%2F%2Fnetbird.jet-net.net&e=box-ivanov-office"
 	withP := payload(t, base+"&p=desktop")
 	withoutP := payload(t, base)
+	if withP.Platform != "desktop" || withoutP.Platform != "" {
+		t.Fatalf("p: %q %q", withP.Platform, withoutP.Platform)
+	}
+	withP.Platform = ""
 	if withP != withoutP || withP.BoxIdentity() != withoutP.BoxIdentity() {
 		t.Fatalf("%+v != %+v", withP, withoutP)
 	}
@@ -238,5 +242,56 @@ func TestBoxIdentityDistinguishesBoxes(t *testing.T) {
 	sameAsA := payload(t, "jetbox://connect#k="+key+"&m=https://MGMT.example.net/&e=one&n=x")
 	if a.BoxIdentity() == b.BoxIdentity() || a.BoxIdentity() != sameAsA.BoxIdentity() {
 		t.Fatal(a.BoxIdentity(), b.BoxIdentity(), sameAsA.BoxIdentity())
+	}
+}
+
+// Облачная ссылка Кабинета: `#k=…&m=…&n=…&p=windows&t=<токен устройства>`, выхода нет.
+const cloudLink = "https://box.jet-net.net/connect#k=" + key + "&m=https%3A%2F%2Fnetbird.jet-net.net&n=%D0%98%D0%B2%D0%B0%D0%BD%D0%BE%D0%B2&p=windows&t=dev-token-aaaa"
+
+func TestCloudLinkDeviceTokenAndPlatform(t *testing.T) {
+	p := payload(t, cloudLink)
+	if p.DeviceToken != "dev-token-aaaa" || p.Platform != "windows" || p.BoxName != "Иванов" || p.ExitNode != "" {
+		t.Fatalf("got %+v", p)
+	}
+}
+
+func TestBoxIdentityRules(t *testing.T) {
+	cloud := payload(t, cloudLink)
+	otherCloud := payload(t, strings.Replace(cloudLink, "dev-token-aaaa", "dev-token-bbbb", 1))
+	box := payload(t, cloudLink+"&e=box-ivanov")
+	old := payload(t, "jetbox://connect#k="+key+"&m=https://NetBird.jet-net.net")
+	named := payload(t, "jetbox://connect#k="+key+"&m=https://NetBird.jet-net.net&n=Dom")
+
+	if got, want := cloud.BoxIdentity(), "netbird.jet-net.net|t:"+Fingerprint("dev-token-aaaa"); got != want {
+		t.Fatalf("облако: %q, want %q", got, want)
+	}
+	if strings.Contains(cloud.BoxIdentity(), "dev-token") {
+		t.Fatal("токен устройства в удостоверении целиком")
+	}
+	if cloud.BoxIdentity() == otherCloud.BoxIdentity() {
+		t.Fatal("разные t — одно удостоверение")
+	}
+	if box.BoxIdentity() != "netbird.jet-net.net|box-ivanov" {
+		t.Fatalf("e важнее t: %q", box.BoxIdentity())
+	}
+	if old.BoxIdentity() != "netbird.jet-net.net|" || named.BoxIdentity() != "netbird.jet-net.net|n:Dom" {
+		t.Fatalf("старые ссылки: %q %q", old.BoxIdentity(), named.BoxIdentity())
+	}
+}
+
+func TestKeyFingerprint(t *testing.T) {
+	a := payload(t, "jetbox://connect#k="+key)
+	upper := payload(t, "jetbox://connect#k="+strings.ToLower(key))
+	other := payload(t, "jetbox://connect#k=1EF79C2F-1A34-4B21-9C0D-1BF529332998")
+	fp := a.KeyFingerprint()
+	if len(fp) != 32 || fp != upper.KeyFingerprint() || fp == other.KeyFingerprint() {
+		t.Fatal(fp, upper.KeyFingerprint(), other.KeyFingerprint())
+	}
+	if strings.Contains(strings.ToLower(fp), strings.ToLower(key[len(key)-4:])) {
+		t.Fatal("в отпечатке кусок ключа")
+	}
+	// Тот же алгоритм, что в iOS: SHA-256(lowercase(key)), первые 16 байт hex.
+	if fp != "7a5d83e156ee9d5beb7073134aeb20ba" {
+		t.Fatal(fp)
 	}
 }

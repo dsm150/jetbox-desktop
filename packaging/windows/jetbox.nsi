@@ -28,7 +28,12 @@ SetCompressor /SOLID lzma
 ; NB_DISABLE_UPDATE_SETTINGS=false в окружении службы: переменные NB_* служба читает поверх флагов, а на машинах,
 ; где официальный NetBird закрыт «managed lock» (netbird_toolset.ps1), в системе стоит NB_DISABLE_UPDATE_SETTINGS=true —
 ; служба отказывала приложению в SetConfig (интерфейс JetBox, порт 51830), и «Подключить» падало с «Что-то пошло не так».
-!define DAEMON_FLAGS '--daemon-addr npipe://jetbox --log-file "${DATA}\client.log" --service-env NB_STATE_DIR="${DATA}" --service-env NB_METRICS_PUSH_ENABLED=false --service-env NB_LOG_MAX_SIZE_MB=5 --service-env NB_DISABLE_UPDATE_SETTINGS=false --disable-profiles'
+; --disable-profiles=false явно: замена подключения (1.0.5) заводит новый профиль службы с новым ключом WireGuard,
+; а служба 1.0.4 записала disable_profiles: true в ${DATA}\service.json — его не удаляет service uninstall, и новый
+; install без флага взял бы сохранённое (cmd/service_params.go applyServiceParams).
+; NB_DNS_STATE_FILE — один файл состояния на все профили (как на macOS; путь профиля default): хвосты DNS/NRPT/
+; маршрутов любого профиля убирает следующий Up, а не только Up того же профиля.
+!define DAEMON_FLAGS '--daemon-addr npipe://jetbox --log-file "${DATA}\client.log" --service-env NB_STATE_DIR="${DATA}" --service-env NB_METRICS_PUSH_ENABLED=false --service-env NB_LOG_MAX_SIZE_MB=5 --service-env NB_DISABLE_UPDATE_SETTINGS=false --service-env NB_DNS_STATE_FILE="${DATA}\state.json" --disable-profiles=false'
 
 Name "${APP}"
 Caption "${APP}"

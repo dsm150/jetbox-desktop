@@ -1,8 +1,8 @@
-//go:build !windows
+//go:build !windows && !darwin
 
 package main
 
-// noAutostart — приложение автозапуск не ведёт (macOS: LaunchAgent ставит .pkg).
+// noAutostart — приложение автозапуск не ведёт.
 type noAutostart struct{}
 
 func newAutostart() autostarter { return noAutostart{} }

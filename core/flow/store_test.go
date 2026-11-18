@@ -17,7 +17,8 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 	want := Box{Identity: "netbird.jet-net.net|sv-demo-exit", Name: "Дом на Лесной",
 		ManagementURL: "https://netbird.jet-net.net", ExitNode: "sv-demo-exit",
-		RegisteredAt: time.Date(2026, 10, 26, 14, 37, 0, 0, time.UTC)}
+		RegisteredAt:   time.Date(2026, 10, 26, 14, 37, 0, 0, time.UTC),
+		KeyFingerprint: "7a5d83e156ee9d5beb7073134aeb20ba", ProfileID: "0123abcd"}
 	if err := s.Save(want); err != nil {
 		t.Fatal(err)
 	}
@@ -158,4 +159,46 @@ func TestStoreConcurrentAccess(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// Запись до 1.0.5: без отпечатка ключа и профиля — читается с пустыми полями.
+func TestStoreLegacyWithoutFingerprint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "box.json")
+	if err := os.WriteFile(path, []byte(`{"identity":"netbird.jet-net.net|","name":"Иванов","auto_connect":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, ok, err := NewStore(path).Load()
+	if !ok || err != nil || b.KeyFingerprint != "" || b.ProfileID != "" || b.Identity != "netbird.jet-net.net|" {
+		t.Fatalf("%+v %v %v", b, ok, err)
+	}
+}
+
+func TestStoreReplaceJournal(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(filepath.Join(dir, "box.json"))
+	if _, ok := s.LoadReplace(); ok {
+		t.Fatal("пустое хранилище")
+	}
+	want := Replace{OldID: "default", NewName: "jetbox-1", NewID: "new1", NewUser: "ivan",
+		At: time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)}
+	if err := s.SaveReplace(want); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "replace.json")); err != nil {
+		t.Fatal("replace.json не рядом с box.json:", err)
+	}
+	if got, ok := s.LoadReplace(); !ok || got != want {
+		t.Fatalf("%+v %v", got, ok)
+	}
+	if err := s.ClearReplace(); err != nil || s.ClearReplace() != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.LoadReplace(); ok {
+		t.Fatal("после Clear запись осталась")
+	}
+	// Испорченная запись — как будто её нет.
+	_ = os.WriteFile(filepath.Join(dir, "replace.json"), []byte("{"), 0o600)
+	if _, ok := s.LoadReplace(); ok {
+		t.Fatal("испорченная запись прочитана")
+	}
 }

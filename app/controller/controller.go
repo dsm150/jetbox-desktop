@@ -255,7 +255,8 @@ func (c *Controller) OnLink(ctx context.Context, raw string) {
 		}
 		c.pending, c.opts = &p, flow.Options{}
 		switch {
-		case has && box.Identity == p.BoxIdentity():
+		case has && (flow.SameConnection(box, p) || box.Identity == p.BoxIdentity()):
+			// Своя ссылка или новая ссылка той же коробки (§2.11) — без вопроса.
 			connectNow = true
 			return false
 		case has:

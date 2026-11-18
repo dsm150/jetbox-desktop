@@ -124,7 +124,8 @@ func newTray(app *application.App, b *bridge, lang string) *tray {
 	})
 	menu.Add(tr(lang, "open")).OnClick(func(*application.Context) { b.showWindow() })
 	menu.AddSeparator()
-	menu.Add(tr(lang, "quit")).OnClick(func(*application.Context) { app.Quit() })
+	// «Выход» во время действия отменяет его и ждёт отката (не на главном потоке).
+	menu.Add(tr(lang, "quit")).OnClick(func(*application.Context) { go b.quit() })
 	t.st.SetMenu(menu)
 
 	// Windows: левый клик — окно, правый — меню (как у апстрима, tray_click_windows.go).

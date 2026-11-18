@@ -155,6 +155,14 @@ func main() {
 	b.ctl = ctl
 	b.tray = newTray(app, b, lang)
 	b.auto, b.dir = newAutostart(), settingsDir()
+	b.recover = engine.Recover
+	b.sshOff = func(ctx context.Context) error {
+		others, err := client.DisableServerSSH(ctx)
+		if others != nil {
+			log.Printf("ssh off: остальные профили: %v", others)
+		}
+		return err
+	}
 
 	// macOS отдаёт ссылку только этим событием; Windows — и в argv, и этим же событием
 	// (Wails сам смотрит argv при одном аргументе) — ссылку из argv берём один раз, ниже.
